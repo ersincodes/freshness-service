@@ -1,59 +1,121 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+import json
+import time
+from dataclasses import dataclass
+
 import requests
 
 from . import archive
-from .config import settings
+from .config import get_settings
 from .scraper import get_clean_text
 from .vector_store import query_similar, upsert_page
 
 
-def _build_context(blocks: list[tuple[str, str]]) -> str:
+@dataclass(frozen=True)
+class SourceContext:
+    url: str
+    text: str
+    timestamp_iso: str
+    is_fresh: bool
+    latency_seconds: float
+
+
+def _parse_json_response(raw: str) -> dict | None:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+def _build_context(blocks: list[SourceContext]) -> str:
     return "\n---\n".join(
-        [f"SOURCE: {url}\nCONTENT: {text}" for url, text in blocks]
+        [f"SOURCE: {block.url}\nCONTENT: {block.text}" for block in blocks]
     )
 
 
-def get_online_context(query: str) -> list[tuple[str, str]]:
-    if not settings.brave_api_key:
-        print("Missing BRAVE_API_KEY; skipping online search.")
-        return []
-
+def _fetch_search_results(query: str, settings) -> list[dict]:
     headers = {
         "Accept": "application/json",
         "X-Subscription-Token": settings.brave_api_key,
     }
     params = {"q": query, "count": settings.max_search_results}
+    resp = requests.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        headers=headers,
+        params=params,
+        timeout=settings.request_timeout_s,
+    )
+    resp.raise_for_status()
+    return resp.json().get("web", {}).get("results", [])
+
+
+async def get_online_context(query: str) -> list[SourceContext]:
+    settings = get_settings()
+    if not settings.brave_api_key:
+        print("Missing BRAVE_API_KEY; skipping online search.")
+        return []
 
     try:
-        resp = requests.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers=headers,
-            params=params,
-            timeout=settings.request_timeout_s,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("web", {}).get("results", [])
+        results = await asyncio.to_thread(_fetch_search_results, query, settings)
     except Exception as exc:
         print(f"Online search failed: {exc}")
         return []
 
-    context_blocks: list[tuple[str, str]] = []
+    tasks: list[asyncio.Task[SourceContext | None]] = []
     for res in results:
         url = res.get("url")
         if not url:
             continue
-        text = get_clean_text(url)
-        if not text:
-            continue
+        title = res.get("title") or ""
+        description = res.get("description") or ""
+        snippet = "\n".join(part for part in [title.strip(), description.strip()] if part)
+        fallback_text = f"SEARCH_SNIPPET:\n{snippet}" if snippet else ""
+        tasks.append(asyncio.create_task(_fetch_source_context(query, url, fallback_text)))
 
-        truncated = text[: settings.max_chars_per_source]
-        archive.save_to_archive(settings.db_path, query, url, text)
+    contexts: list[SourceContext] = []
+    for result in await asyncio.gather(*tasks):
+        if result is not None:
+            contexts.append(result)
+    return contexts
 
-        if settings.offline_retrieval_mode == "semantic":
-            timestamp = dt.datetime.utcnow().isoformat()
-            upsert_page(
+
+async def _fetch_source_context(
+    query: str, url: str, fallback_text: str
+) -> SourceContext | None:
+    settings = get_settings()
+    start = time.perf_counter()
+    try:
+        text = await asyncio.wait_for(
+            get_clean_text(url), timeout=settings.request_timeout_s
+        )
+    except asyncio.TimeoutError:
+        text = None
+    latency = time.perf_counter() - start
+    if not text:
+        if not fallback_text:
+            return None
+        text = fallback_text
+
+    truncated = text[: settings.max_chars_per_source]
+    await asyncio.to_thread(archive.save_to_archive, settings.db_path, query, url, text)
+    timestamp = dt.datetime.utcnow().isoformat()
+
+    if settings.offline_retrieval_mode == "semantic":
+        try:
+            await asyncio.to_thread(
+                upsert_page,
                 settings.chroma_dir,
                 settings.embed_model_name,
                 archive.hash_url(url),
@@ -61,45 +123,148 @@ def get_online_context(query: str) -> list[tuple[str, str]]:
                 text,
                 timestamp,
             )
+        except Exception as exc:
+            print(f"Chroma upsert failed; continuing without vector store: {exc}")
 
-        context_blocks.append((url, truncated))
+    return SourceContext(
+        url=url,
+        text=truncated,
+        timestamp_iso=timestamp,
+        is_fresh=True,
+        latency_seconds=latency,
+    )
 
-    return context_blocks
 
-
-def _get_offline_context(query: str) -> list[tuple[str, str]]:
+async def _get_offline_context(query: str) -> list[SourceContext]:
+    settings = get_settings()
     if settings.offline_retrieval_mode == "semantic":
-        return query_similar(
-            settings.chroma_dir,
-            settings.embed_model_name,
-            query,
-            settings.semantic_top_k,
+        try:
+            rows = await asyncio.to_thread(
+                query_similar,
+                settings.chroma_dir,
+                settings.embed_model_name,
+                query,
+                settings.semantic_top_k,
+            )
+        except Exception as exc:
+            print(
+                "Semantic retrieval failed; falling back to keyword search. "
+                f"Error: {exc}"
+            )
+            rows = await asyncio.to_thread(
+                archive.search_offline, settings.db_path, query, settings.semantic_top_k
+            )
+    else:
+        rows = await asyncio.to_thread(
+            archive.search_offline, settings.db_path, query, settings.semantic_top_k
         )
-    return archive.search_offline(settings.db_path, query, settings.semantic_top_k)
+
+    contexts: list[SourceContext] = []
+    for url, text, timestamp in rows:
+        contexts.append(
+            SourceContext(
+                url=url,
+                text=text[: settings.max_chars_per_source],
+                timestamp_iso=str(timestamp),
+                is_fresh=False,
+                latency_seconds=0.0,
+            )
+        )
+    return contexts
 
 
-def ask_llm(user_query: str) -> str:
-    context_blocks = get_online_context(user_query)
+async def _gather_contexts(user_query: str) -> tuple[str, list[SourceContext]]:
+    contexts = await get_online_context(user_query)
     mode = "ONLINE"
 
-    if not context_blocks:
+    if not contexts:
         print("Offline mode: Checking local archive...")
-        offline_blocks = _get_offline_context(user_query)
-        if offline_blocks:
+        contexts = await _get_offline_context(user_query)
+        if contexts:
             mode = "OFFLINE_ARCHIVE"
-            context_blocks = [
-                (url, text[: settings.max_chars_per_source])
-                for url, text in offline_blocks
-            ]
         else:
             mode = "LOCAL_WEIGHTS"
-            context_blocks = [("N/A", "No fresh information found.")]
+            contexts = [
+                SourceContext(
+                    url="N/A",
+                    text="No fresh information found.",
+                    timestamp_iso=dt.datetime.utcnow().isoformat(),
+                    is_fresh=False,
+                    latency_seconds=0.0,
+                )
+            ]
 
+    return mode, contexts
+
+
+def _post_llm(payload: dict, settings) -> str:
+    response = requests.post(
+        f"{settings.lm_studio_base_url}/chat/completions",
+        json=payload,
+        timeout=settings.request_timeout_s,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
+async def _extract_with_llm(
+    user_query: str, context_blocks: list[SourceContext], settings
+) -> dict | None:
     system_prompt = (
-        "You are a helpful AI with access to real-time web data.\n"
+        "You are a strict information extraction engine.\n"
+        "Use ONLY the provided context. Return a JSON object with keys:\n"
+        '- "answer": string or null\n'
+        '- "citation_url": string or null\n'
+        '- "evidence_quote": string or null\n'
+        "If the answer is not explicitly present in the context, "
+        "set all fields to null.\n"
+        "Do NOT add any extra text.\n\n"
+        "CONTEXT:\n"
+        f"{_build_context(context_blocks)}"
+    )
+    payload = {
+        "model": settings.model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_query},
+        ],
+        "temperature": 0.0,
+    }
+    raw = await asyncio.to_thread(_post_llm, payload, settings)
+    return _parse_json_response(raw)
+
+
+async def ask_llm_async(user_query: str) -> tuple[str, str, list[SourceContext]]:
+    settings = get_settings()
+    mode, context_blocks = await _gather_contexts(user_query)
+    extraction = await _extract_with_llm(user_query, context_blocks, settings)
+    if extraction:
+        answer = extraction.get("answer")
+        citation_url = extraction.get("citation_url")
+        evidence = extraction.get("evidence_quote")
+        if answer and citation_url:
+            response = f"{answer}\n\nSource: {citation_url}"
+            if evidence:
+                response = f"{response}\nEvidence: {evidence}"
+            return response, mode, context_blocks
+    if mode in {"OFFLINE_ARCHIVE", "LOCAL_WEIGHTS"}:
+        if mode == "OFFLINE_ARCHIVE":
+            response = (
+                "I could not verify the answer from the offline archive. "
+                "Please try online mode or add a relevant source."
+            )
+        else:
+            response = (
+                "I do not have any sources to answer this question. "
+                "Please try online mode or add sources to the archive."
+            )
+        return response, mode, context_blocks
+    system_prompt = (
+        "You are a helpful AI that answers ONLY from provided context.\n"
         f"Current Mode: {mode}\n"
-        "Instructions: Use the provided context to answer. If the context is empty, "
-        "rely on your training data but warn the user.\n"
+        "Instructions: Use the provided context to answer. "
+        "If the context is empty or does not contain the exact answer, "
+        "say you could not verify it and ask to try again.\n"
         "Always cite the URL for factual claims.\n\n"
         "CONTEXT:\n"
         f"{_build_context(context_blocks)}"
@@ -111,19 +276,20 @@ def ask_llm(user_query: str) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_query},
         ],
-        "temperature": 0.7,
+        "temperature": 0.2,
     }
 
-    response = requests.post(
-        f"{settings.lm_studio_base_url}/chat/completions",
-        json=payload,
-        timeout=settings.request_timeout_s,
-    )
-    response.raise_for_status()
-    return response.json()["choices"][0]["message"]["content"]
+    answer = await asyncio.to_thread(_post_llm, payload, settings)
+    return answer, mode, context_blocks
+
+
+def ask_llm(user_query: str) -> str:
+    answer, _, _ = asyncio.run(ask_llm_async(user_query))
+    return answer
 
 
 def run_cli() -> None:
+    settings = get_settings()
     archive.init_db(settings.db_path)
     print("Freshness Service Started.")
     while True:
