@@ -52,13 +52,15 @@ def save_to_archive(db_path: str, query: str, url: str, content: str) -> None:
         conn.commit()
 
 
-def search_offline(db_path: str, query: str, top_k: int = 3) -> list[tuple[str, str]]:
+def search_offline(
+    db_path: str, query: str, top_k: int = 3
+) -> list[tuple[str, str, str]]:
     search_term = f"%{query.lower()}%"
     with sqlite3.connect(db_path) as conn:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT DISTINCT p.url, p.content
+            SELECT DISTINCT p.url, p.content, p.timestamp
             FROM pages p
             JOIN search_history s ON p.url_hash = s.url_hash
             WHERE s.query LIKE ? OR p.content LIKE ?
@@ -67,5 +69,5 @@ def search_offline(db_path: str, query: str, top_k: int = 3) -> list[tuple[str, 
             """,
             (search_term, search_term, top_k),
         )
-        rows: Iterable[tuple[str, str]] = cur.fetchall()
+        rows: Iterable[tuple[str, str, str]] = cur.fetchall()
     return list(rows)

@@ -23,6 +23,9 @@ Python packages:
 - `requests`
 - `beautifulsoup4`
 - `python-dotenv` (loads `.env` for local development)
+- `fastapi`
+- `uvicorn`
+- `playwright` (JS-rendered pages)
 
 Optional (for semantic offline retrieval):
 - `chromadb`
@@ -46,7 +49,8 @@ source .venv/bin/activate
 Install base deps:
 
 ```bash
-pip install requests beautifulsoup4 python-dotenv
+pip install requests beautifulsoup4 python-dotenv fastapi uvicorn playwright
+playwright install
 ```
 
 Install semantic deps:
@@ -164,6 +168,25 @@ python -m freshness_service
 ```
 
 Exit with `exit` or `quit`.
+
+## Running as an API
+
+```bash
+uvicorn freshness_service.app:app --host 0.0.0.0 --port 8000
+```
+
+Example requests:
+
+```bash
+curl "http://localhost:8000/"
+curl "http://localhost:8000/freshness?query=What%20is%20new%20in%20Python%203.13"
+```
+
+API docs:
+
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+- OpenAPI JSON: `http://localhost:8000/openapi.json`
 
 ## Operational Notes / Limitations
 
