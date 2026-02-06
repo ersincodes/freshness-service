@@ -13,6 +13,9 @@ from .config import get_settings
 from .scraper import get_clean_text
 from .vector_store import query_similar, upsert_page
 
+# Import answer caching functions
+from .archive import save_answer, get_cached_answer
+
 
 @dataclass(frozen=True)
 class SourceContext:
@@ -237,16 +240,48 @@ async def _extract_with_llm(
 async def ask_llm_async(user_query: str) -> tuple[str, str, list[SourceContext]]:
     settings = get_settings()
     mode, context_blocks = await _gather_contexts(user_query)
+    
+    # In offline mode, first check if we have a cached answer
+    if mode == "OFFLINE_ARCHIVE":
+        cached = await asyncio.to_thread(
+            get_cached_answer, settings.db_path, user_query
+        )
+        if cached:
+            answer_text, citation_url, evidence, timestamp = cached
+            response = f"{answer_text}\n\nSource: {citation_url or 'cached answer'}"
+            if evidence:
+                response = f"{response}\nEvidence: {evidence}"
+            response = f"{response}\n(Cached from: {timestamp})"
+            return response, mode, context_blocks
+    
     extraction = await _extract_with_llm(user_query, context_blocks, settings)
     if extraction:
         answer = extraction.get("answer")
         citation_url = extraction.get("citation_url")
         evidence = extraction.get("evidence_quote")
-        if answer and citation_url:
-            response = f"{answer}\n\nSource: {citation_url}"
+        # Accept answer even if citation_url is missing (more lenient)
+        if answer:
+            # Try to infer citation from context if not provided
+            if not citation_url and context_blocks:
+                citation_url = context_blocks[0].url
+            
+            response = f"{answer}\n\nSource: {citation_url or 'extracted from context'}"
             if evidence:
                 response = f"{response}\nEvidence: {evidence}"
+            
+            # Save successful answer to cache for future offline use
+            if mode == "ONLINE":
+                await asyncio.to_thread(
+                    save_answer,
+                    settings.db_path,
+                    user_query,
+                    answer,
+                    citation_url,
+                    evidence,
+                )
+            
             return response, mode, context_blocks
+    
     if mode in {"OFFLINE_ARCHIVE", "LOCAL_WEIGHTS"}:
         if mode == "OFFLINE_ARCHIVE":
             response = (
@@ -280,6 +315,20 @@ async def ask_llm_async(user_query: str) -> tuple[str, str, list[SourceContext]]
     }
 
     answer = await asyncio.to_thread(_post_llm, payload, settings)
+    
+    # Save successful answer from fallback LLM call
+    if answer and mode == "ONLINE":
+        # Extract first URL from context as citation
+        first_url = context_blocks[0].url if context_blocks else None
+        await asyncio.to_thread(
+            save_answer,
+            settings.db_path,
+            user_query,
+            answer,
+            first_url,
+            None,
+        )
+    
     return answer, mode, context_blocks
 
 
