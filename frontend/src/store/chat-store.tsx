@@ -1,0 +1,418 @@
+/**
+ * Chat state management using React Context.
+ * Manages conversations, messages, and streaming state.
+ * 
+ * Architecture:
+ * - Uses useReducer for predictable state updates
+ * - Delegates streaming to useChatStream hook
+ * - Uses refs to avoid stale closure issues in async callbacks
+ * - Persists conversations to localStorage
+ */
+
+import {
+  createContext,
+  useContext,
+  useReducer,
+  useCallback,
+  useRef,
+  useEffect,
+  type ReactNode,
+} from "react";
+import type { ChatTurn, Conversation, Source, RetrievalMode } from "../lib/types";
+import { generateId, storage } from "../lib/utils";
+import { sendChatMessage } from "../lib/api";
+import { useChatStream } from "../lib/use-chat-stream";
+
+// ============================================================================
+// State Types
+// ============================================================================
+
+interface ChatState {
+  conversations: Conversation[];
+  activeConversationId: string | null;
+  isLoading: boolean;
+  error: string | null;
+}
+
+type ChatAction =
+  | { type: "SET_CONVERSATIONS"; payload: Conversation[] }
+  | { type: "SET_ACTIVE_CONVERSATION"; payload: string | null }
+  | { type: "CREATE_CONVERSATION"; payload: Conversation }
+  | { type: "DELETE_CONVERSATION"; payload: string }
+  | { type: "ADD_TURN"; payload: { conversationId: string; turn: ChatTurn } }
+  | { type: "UPDATE_TURN"; payload: { conversationId: string; turnId: string; updates: Partial<ChatTurn> } }
+  | { type: "APPEND_TO_TURN"; payload: { conversationId: string; turnId: string; content: string } }
+  | { type: "SET_LOADING"; payload: boolean }
+  | { type: "SET_ERROR"; payload: string | null }
+  | { type: "CLEAR_CONVERSATION"; payload: string };
+
+// ============================================================================
+// Storage Keys
+// ============================================================================
+
+const STORAGE_KEY = "freshness-chat-conversations";
+
+// ============================================================================
+// Reducer
+// ============================================================================
+
+function chatReducer(state: ChatState, action: ChatAction): ChatState {
+  switch (action.type) {
+    case "SET_CONVERSATIONS":
+      return { ...state, conversations: action.payload };
+
+    case "SET_ACTIVE_CONVERSATION":
+      return { ...state, activeConversationId: action.payload };
+
+    case "CREATE_CONVERSATION":
+      return {
+        ...state,
+        conversations: [action.payload, ...state.conversations],
+        activeConversationId: action.payload.id,
+      };
+
+    case "DELETE_CONVERSATION": {
+      const filtered = state.conversations.filter((c) => c.id !== action.payload);
+      return {
+        ...state,
+        conversations: filtered,
+        activeConversationId:
+          state.activeConversationId === action.payload
+            ? filtered[0]?.id || null
+            : state.activeConversationId,
+      };
+    }
+
+    case "ADD_TURN": {
+      return {
+        ...state,
+        conversations: state.conversations.map((c) =>
+          c.id === action.payload.conversationId
+            ? {
+                ...c,
+                turns: [...c.turns, action.payload.turn],
+                updated_at: new Date().toISOString(),
+              }
+            : c
+        ),
+      };
+    }
+
+    case "UPDATE_TURN": {
+      return {
+        ...state,
+        conversations: state.conversations.map((c) =>
+          c.id === action.payload.conversationId
+            ? {
+                ...c,
+                turns: c.turns.map((t) =>
+                  t.id === action.payload.turnId
+                    ? { ...t, ...action.payload.updates }
+                    : t
+                ),
+                updated_at: new Date().toISOString(),
+              }
+            : c
+        ),
+      };
+    }
+
+    case "APPEND_TO_TURN": {
+      return {
+        ...state,
+        conversations: state.conversations.map((c) =>
+          c.id === action.payload.conversationId
+            ? {
+                ...c,
+                turns: c.turns.map((t) =>
+                  t.id === action.payload.turnId
+                    ? { ...t, content: t.content + action.payload.content }
+                    : t
+                ),
+              }
+            : c
+        ),
+      };
+    }
+
+    case "SET_LOADING":
+      return { ...state, isLoading: action.payload };
+
+    case "SET_ERROR":
+      return { ...state, error: action.payload };
+
+    case "CLEAR_CONVERSATION": {
+      return {
+        ...state,
+        conversations: state.conversations.map((c) =>
+          c.id === action.payload
+            ? { ...c, turns: [], updated_at: new Date().toISOString() }
+            : c
+        ),
+      };
+    }
+
+    default:
+      return state;
+  }
+}
+
+// ============================================================================
+// Context
+// ============================================================================
+
+interface ChatContextValue {
+  state: ChatState;
+  activeConversation: Conversation | null;
+  createConversation: () => void;
+  deleteConversation: (id: string) => void;
+  setActiveConversation: (id: string | null) => void;
+  sendMessage: (content: string, useStreaming?: boolean) => Promise<void>;
+  stopStreaming: () => void;
+  clearConversation: (id: string) => void;
+}
+
+const ChatContext = createContext<ChatContextValue | null>(null);
+
+// ============================================================================
+// Provider
+// ============================================================================
+
+interface ChatProviderProps {
+  children: ReactNode;
+}
+
+export function ChatProvider({ children }: ChatProviderProps) {
+  const [state, dispatch] = useReducer(chatReducer, {
+    conversations: storage.get<Conversation[]>(STORAGE_KEY, []),
+    activeConversationId: null,
+    isLoading: false,
+    error: null,
+  });
+
+  // Use ref to always have access to latest state in async callbacks
+  // This fixes the stale closure bug where callbacks captured old state
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
+
+  // Streaming hook
+  const { startStream, abortStream } = useChatStream();
+
+  // Persist conversations to localStorage whenever they change
+  useEffect(() => {
+    storage.set(STORAGE_KEY, state.conversations);
+  }, [state.conversations]);
+
+  // Get active conversation
+  const activeConversation =
+    state.conversations.find((c) => c.id === state.activeConversationId) || null;
+
+  // Create new conversation
+  const createConversation = useCallback(() => {
+    const conversation: Conversation = {
+      id: generateId(),
+      title: "New Chat",
+      turns: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    dispatch({ type: "CREATE_CONVERSATION", payload: conversation });
+  }, []);
+
+  // Delete conversation
+  const deleteConversation = useCallback((id: string) => {
+    dispatch({ type: "DELETE_CONVERSATION", payload: id });
+  }, []);
+
+  // Set active conversation
+  const setActiveConversation = useCallback((id: string | null) => {
+    dispatch({ type: "SET_ACTIVE_CONVERSATION", payload: id });
+  }, []);
+
+  // Stop streaming
+  const stopStreaming = useCallback(() => {
+    abortStream();
+    dispatch({ type: "SET_LOADING", payload: false });
+  }, [abortStream]);
+
+  // Send message
+  const sendMessage = useCallback(
+    async (content: string, useStreaming: boolean = true) => {
+      if (!content.trim()) return;
+
+      // Create conversation if none exists
+      let conversationId = stateRef.current.activeConversationId;
+      if (!conversationId) {
+        const conversation: Conversation = {
+          id: generateId(),
+          title: content.slice(0, 50) + (content.length > 50 ? "..." : ""),
+          turns: [],
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        };
+        dispatch({ type: "CREATE_CONVERSATION", payload: conversation });
+        conversationId = conversation.id;
+      }
+
+      // Add user message
+      const userTurn: ChatTurn = {
+        id: generateId(),
+        role: "user",
+        content,
+        created_at: new Date().toISOString(),
+      };
+      dispatch({ type: "ADD_TURN", payload: { conversationId, turn: userTurn } });
+
+      // Create assistant turn placeholder
+      const assistantTurnId = generateId();
+      const assistantTurn: ChatTurn = {
+        id: assistantTurnId,
+        role: "assistant",
+        content: "",
+        created_at: new Date().toISOString(),
+        isStreaming: useStreaming,
+      };
+      dispatch({ type: "ADD_TURN", payload: { conversationId, turn: assistantTurn } });
+
+      dispatch({ type: "SET_LOADING", payload: true });
+      dispatch({ type: "SET_ERROR", payload: null });
+
+      // Capture conversationId and assistantTurnId for callbacks
+      // These are stable values that won't change during streaming
+      const targetConversationId = conversationId;
+      const targetTurnId = assistantTurnId;
+
+      try {
+        if (useStreaming) {
+          // Streaming mode using the dedicated hook
+          startStream(
+            { query: content, conversation_id: targetConversationId },
+            {
+              onMeta: (data) => {
+                dispatch({
+                  type: "UPDATE_TURN",
+                  payload: {
+                    conversationId: targetConversationId,
+                    turnId: targetTurnId,
+                    updates: {
+                      mode: data.mode as RetrievalMode,
+                      sources: data.sources as Source[],
+                    },
+                  },
+                });
+              },
+              onToken: (data) => {
+                dispatch({
+                  type: "APPEND_TO_TURN",
+                  payload: {
+                    conversationId: targetConversationId,
+                    turnId: targetTurnId,
+                    content: data.text,
+                  },
+                });
+              },
+              onDone: () => {
+                dispatch({
+                  type: "UPDATE_TURN",
+                  payload: {
+                    conversationId: targetConversationId,
+                    turnId: targetTurnId,
+                    updates: { isStreaming: false },
+                  },
+                });
+                dispatch({ type: "SET_LOADING", payload: false });
+              },
+              onError: (data) => {
+                dispatch({
+                  type: "UPDATE_TURN",
+                  payload: {
+                    conversationId: targetConversationId,
+                    turnId: targetTurnId,
+                    updates: {
+                      isStreaming: false,
+                      error: { code: data.code, message: data.message },
+                      content: `Error: ${data.message}`,
+                    },
+                  },
+                });
+                dispatch({ type: "SET_LOADING", payload: false });
+                dispatch({ type: "SET_ERROR", payload: data.message });
+              },
+            }
+          );
+        } else {
+          // Non-streaming mode
+          const response = await sendChatMessage({
+            query: content,
+            conversation_id: targetConversationId,
+          });
+
+          dispatch({
+            type: "UPDATE_TURN",
+            payload: {
+              conversationId: targetConversationId,
+              turnId: targetTurnId,
+              updates: {
+                content: response.answer,
+                mode: response.mode,
+                sources: response.sources,
+                isStreaming: false,
+              },
+            },
+          });
+
+          dispatch({ type: "SET_LOADING", payload: false });
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        dispatch({
+          type: "UPDATE_TURN",
+          payload: {
+            conversationId: targetConversationId,
+            turnId: targetTurnId,
+            updates: {
+              isStreaming: false,
+              error: { code: "ERROR", message },
+              content: `Error: ${message}`,
+            },
+          },
+        });
+        dispatch({ type: "SET_LOADING", payload: false });
+        dispatch({ type: "SET_ERROR", payload: message });
+      }
+    },
+    [startStream]
+  );
+
+  // Clear conversation
+  const clearConversation = useCallback((id: string) => {
+    dispatch({ type: "CLEAR_CONVERSATION", payload: id });
+  }, []);
+
+  const value: ChatContextValue = {
+    state,
+    activeConversation,
+    createConversation,
+    deleteConversation,
+    setActiveConversation,
+    sendMessage,
+    stopStreaming,
+    clearConversation,
+  };
+
+  return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
+}
+
+// ============================================================================
+// Hook
+// ============================================================================
+
+export function useChat() {
+  const context = useContext(ChatContext);
+  if (!context) {
+    throw new Error("useChat must be used within a ChatProvider");
+  }
+  return context;
+}

@@ -138,7 +138,7 @@ async def _fetch_source_context(
     )
 
 
-async def _get_offline_context(query: str) -> list[SourceContext]:
+async def get_offline_context(query: str) -> list[SourceContext]:
     settings = get_settings()
     if settings.offline_retrieval_mode == "semantic":
         try:
@@ -182,7 +182,7 @@ async def _gather_contexts(user_query: str) -> tuple[str, list[SourceContext]]:
 
     if not contexts:
         print("Offline mode: Checking local archive...")
-        contexts = await _get_offline_context(user_query)
+        contexts = await get_offline_context(user_query)
         if contexts:
             mode = "OFFLINE_ARCHIVE"
         else:

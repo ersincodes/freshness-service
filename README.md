@@ -70,6 +70,14 @@ freshness_service/
   vector_store.py  # ChromaDB store + offline retrieval (semantic)
   scraper.py       # URL fetch + HTML -> clean text extraction
   main.py          # Orchestrator CLI (online retrieval + offline fallback + LLM call)
+  app.py           # FastAPI application with REST API endpoints
+
+frontend/          # React + TypeScript chat application
+  src/
+    components/    # UI components (chat, archive, settings)
+    lib/           # API client, types, utilities
+    store/         # Chat state management
+  README.md        # Frontend-specific documentation
 ```
 
 Runtime data:
@@ -187,6 +195,29 @@ API docs:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 - OpenAPI JSON: `http://localhost:8000/openapi.json`
+
+### New Chat API Endpoints
+
+The following endpoints are available for the chat frontend:
+
+- `POST /api/chat` - Send a chat message and receive a structured response with sources
+- `POST /api/chat/stream` - Stream chat responses via Server-Sent Events (SSE)
+- `GET /api/archive/search?q=...` - Search archived pages
+- `GET /api/archive/page/{url_hash}` - Get archived page details
+- `GET /api/settings` - Get current configuration (non-secret values)
+- `GET /api/health` - Check health of backend, LM Studio, and Brave Search
+
+## Running the Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The frontend will be available at `http://localhost:5173`.
+
+Make sure the backend is running on `http://localhost:8000` (or configure `VITE_API_BASE_URL` in frontend `.env`).
 
 ## Operational Notes / Limitations
 
