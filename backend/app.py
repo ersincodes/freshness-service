@@ -50,6 +50,10 @@ class ChatRequest(BaseModel):
     """Request body for chat endpoint."""
     query: str = Field(..., min_length=1, description="User's question")
     conversation_id: str | None = Field(None, description="Optional conversation ID for context")
+    prefer_mode: Literal["ONLINE", "OFFLINE"] | None = Field(
+        None,
+        description="Optional retrieval preference. ONLINE forces online retrieval, OFFLINE forces archive retrieval.",
+    )
 
 
 class TimingInfo(BaseModel):
@@ -208,7 +212,9 @@ async def chat(request: ChatRequest) -> ChatResponse:
     search_start = time.perf_counter()
     
     try:
-        answer, mode, contexts = await ask_llm_async(request.query)
+        answer, mode, contexts = await ask_llm_async(
+            request.query, prefer_mode=request.prefer_mode
+        )
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -258,16 +264,31 @@ async def chat_stream(request: ChatRequest):
         
         try:
             # Gather contexts first
-            contexts = await get_online_context(request.query)
-            mode = "ONLINE"
-            
-            if not contexts:
+            if request.prefer_mode == "OFFLINE":
                 contexts = await get_offline_context(request.query)
                 if contexts:
                     mode = "OFFLINE_ARCHIVE"
                 else:
                     mode = "LOCAL_WEIGHTS"
                     contexts = []
+            elif request.prefer_mode == "ONLINE":
+                contexts = await get_online_context(request.query)
+                if contexts:
+                    mode = "ONLINE"
+                else:
+                    mode = "LOCAL_WEIGHTS"
+                    contexts = []
+            else:
+                contexts = await get_online_context(request.query)
+                mode = "ONLINE"
+
+                if not contexts:
+                    contexts = await get_offline_context(request.query)
+                    if contexts:
+                        mode = "OFFLINE_ARCHIVE"
+                    else:
+                        mode = "LOCAL_WEIGHTS"
+                        contexts = []
             
             # Convert contexts to sources
             retrieval_type = _determine_retrieval_type(mode, settings)

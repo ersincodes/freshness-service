@@ -176,7 +176,44 @@ async def get_offline_context(query: str) -> list[SourceContext]:
     return contexts
 
 
-async def _gather_contexts(user_query: str) -> tuple[str, list[SourceContext]]:
+async def _gather_contexts(
+    user_query: str, prefer_mode: str | None = None
+) -> tuple[str, list[SourceContext]]:
+    if prefer_mode == "OFFLINE":
+        print("Offline mode: Checking local archive...")
+        contexts = await get_offline_context(user_query)
+        if contexts:
+            return "OFFLINE_ARCHIVE", contexts
+        return (
+            "LOCAL_WEIGHTS",
+            [
+                SourceContext(
+                    url="N/A",
+                    text="No offline information found.",
+                    timestamp_iso=dt.datetime.utcnow().isoformat(),
+                    is_fresh=False,
+                    latency_seconds=0.0,
+                )
+            ],
+        )
+
+    if prefer_mode == "ONLINE":
+        contexts = await get_online_context(user_query)
+        if contexts:
+            return "ONLINE", contexts
+        return (
+            "LOCAL_WEIGHTS",
+            [
+                SourceContext(
+                    url="N/A",
+                    text="No online information found.",
+                    timestamp_iso=dt.datetime.utcnow().isoformat(),
+                    is_fresh=False,
+                    latency_seconds=0.0,
+                )
+            ],
+        )
+
     contexts = await get_online_context(user_query)
     mode = "ONLINE"
 
@@ -237,9 +274,11 @@ async def _extract_with_llm(
     return _parse_json_response(raw)
 
 
-async def ask_llm_async(user_query: str) -> tuple[str, str, list[SourceContext]]:
+async def ask_llm_async(
+    user_query: str, prefer_mode: str | None = None
+) -> tuple[str, str, list[SourceContext]]:
     settings = get_settings()
-    mode, context_blocks = await _gather_contexts(user_query)
+    mode, context_blocks = await _gather_contexts(user_query, prefer_mode=prefer_mode)
     
     # In offline mode, first check if we have a cached answer
     if mode == "OFFLINE_ARCHIVE":

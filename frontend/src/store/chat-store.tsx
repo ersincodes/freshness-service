@@ -18,7 +18,13 @@ import {
   useEffect,
   type ReactNode,
 } from "react";
-import type { ChatTurn, Conversation, Source, RetrievalMode } from "../lib/types";
+import type {
+  ChatTurn,
+  Conversation,
+  Source,
+  RetrievalMode,
+  PreferredChatMode,
+} from "../lib/types";
 import { generateId, storage } from "../lib/utils";
 import { sendChatMessage } from "../lib/api";
 import { useChatStream } from "../lib/use-chat-stream";
@@ -32,6 +38,7 @@ interface ChatState {
   activeConversationId: string | null;
   isLoading: boolean;
   error: string | null;
+  preferredMode: PreferredChatMode;
 }
 
 type ChatAction =
@@ -44,6 +51,7 @@ type ChatAction =
   | { type: "APPEND_TO_TURN"; payload: { conversationId: string; turnId: string; content: string } }
   | { type: "SET_LOADING"; payload: boolean }
   | { type: "SET_ERROR"; payload: string | null }
+  | { type: "SET_PREFERRED_MODE"; payload: PreferredChatMode }
   | { type: "CLEAR_CONVERSATION"; payload: string };
 
 // ============================================================================
@@ -141,6 +149,9 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "SET_ERROR":
       return { ...state, error: action.payload };
 
+    case "SET_PREFERRED_MODE":
+      return { ...state, preferredMode: action.payload };
+
     case "CLEAR_CONVERSATION": {
       return {
         ...state,
@@ -170,6 +181,7 @@ interface ChatContextValue {
   sendMessage: (content: string, useStreaming?: boolean) => Promise<void>;
   stopStreaming: () => void;
   clearConversation: (id: string) => void;
+  setPreferredMode: (mode: PreferredChatMode) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -188,6 +200,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     activeConversationId: null,
     isLoading: false,
     error: null,
+    preferredMode: "ONLINE",
   });
 
   // Use ref to always have access to latest state in async callbacks
@@ -236,6 +249,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
     abortStream();
     dispatch({ type: "SET_LOADING", payload: false });
   }, [abortStream]);
+
+  const setPreferredMode = useCallback((mode: PreferredChatMode) => {
+    dispatch({ type: "SET_PREFERRED_MODE", payload: mode });
+  }, []);
 
   // Send message
   const sendMessage = useCallback(
@@ -288,7 +305,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
         if (useStreaming) {
           // Streaming mode using the dedicated hook
           startStream(
-            { query: content, conversation_id: targetConversationId },
+            {
+              query: content,
+              conversation_id: targetConversationId,
+              prefer_mode: stateRef.current.preferredMode,
+            },
             {
               onMeta: (data) => {
                 dispatch({
@@ -347,6 +368,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
           const response = await sendChatMessage({
             query: content,
             conversation_id: targetConversationId,
+            prefer_mode: stateRef.current.preferredMode,
           });
 
           dispatch({
@@ -400,6 +422,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     sendMessage,
     stopStreaming,
     clearConversation,
+    setPreferredMode,
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

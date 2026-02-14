@@ -48,7 +48,7 @@ export function Composer({
   return (
     <div className="border-t border-gray-200 bg-white p-4">
       <form onSubmit={handleSubmit} className="max-w-3xl mx-auto">
-        <div className="flex items-end gap-2">
+        <div className="flex items-center gap-2">
           <div className="flex-1 relative">
             <textarea
               ref={textareaRef}
@@ -59,7 +59,7 @@ export function Composer({
               disabled={disabled}
               rows={1}
               className={cn(
-                "w-full resize-none rounded-lg border border-gray-300 px-4 py-3 pr-12",
+                "w-full resize-none rounded-lg border border-gray-300 px-4 py-3",
                 "text-sm placeholder:text-gray-400",
                 "focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent",
                 "disabled:cursor-not-allowed disabled:opacity-50",
@@ -74,7 +74,7 @@ export function Composer({
               onClick={onStop}
               variant="destructive"
               size="icon"
-              className="flex-shrink-0"
+              className="flex-shrink-0 h-[46px] w-[46px] rounded-lg self-stretch"
             >
               <Square className="h-4 w-4" />
             </Button>
@@ -83,7 +83,7 @@ export function Composer({
               type="submit"
               disabled={!message.trim() || disabled}
               size="icon"
-              className="flex-shrink-0"
+              className="flex-shrink-0 h-[46px] w-[46px] rounded-lg self-stretch"
             >
               {disabled ? (
                 <Loader2 className="h-4 w-4 animate-spin" />
