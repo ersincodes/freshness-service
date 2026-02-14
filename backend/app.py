@@ -14,6 +14,16 @@ from pydantic import BaseModel, Field
 from . import archive
 from .config import get_settings, update_settings
 from .main import SourceContext, ask_llm_async, get_online_context, get_offline_context
+from .freshness import (
+    FreshnessReportResponse,
+    SingleSourceFreshnessResponse,
+    FreshnessStatus,
+    check_all_sources_freshness,
+    check_source_freshness,
+    get_source_by_name,
+    get_enabled_sources,
+    load_sources_config,
+)
 
 app = FastAPI(
     title="Freshness Service",
@@ -656,6 +666,115 @@ async def health_check() -> HealthResponse:
 
 
 # ============================================================================
+# API Routes - Freshness (TTL-based)
+# ============================================================================
+
+@app.get("/api/freshness", response_model=FreshnessReportResponse)
+async def get_freshness_report() -> FreshnessReportResponse:
+    """
+    Get a detailed freshness report for all configured data sources.
+    
+    Returns a breakdown of which sources are fresh vs stale based on their
+    configured TTL (Time-to-Live) thresholds.
+    
+    The response includes:
+    - Overview with counts of fresh/stale/error sources
+    - Detailed information for each source including:
+      - Last modified timestamp
+      - Age in minutes/seconds
+      - Time until stale (negative if already stale)
+      - TTL configuration
+    """
+    settings = get_settings()
+    report = await asyncio.to_thread(
+        check_all_sources_freshness,
+        default_db_path=settings.db_path,
+    )
+    return report
+
+
+@app.get("/api/freshness/{source_id}", response_model=SingleSourceFreshnessResponse)
+async def get_source_freshness(source_id: str) -> SingleSourceFreshnessResponse:
+    """
+    Get freshness status for a specific data source.
+    
+    Args:
+        source_id: The unique identifier of the source (as defined in sources.yaml)
+        
+    Returns:
+        Detailed freshness information including:
+        - Current status (fresh/stale/error/unknown)
+        - Age and time until stale
+        - Last modified timestamp
+        
+    Raises:
+        404: If the source is not found in configuration
+    """
+    source = get_source_by_name(source_id)
+    
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "SOURCE_NOT_FOUND",
+                "message": f"Source '{source_id}' not found in configuration",
+            },
+        )
+    
+    settings = get_settings()
+    detail = await asyncio.to_thread(
+        check_source_freshness,
+        source,
+        default_db_path=settings.db_path,
+    )
+    
+    return SingleSourceFreshnessResponse(
+        detail=detail,
+        is_fresh=detail.status == FreshnessStatus.FRESH,
+    )
+
+
+@app.get("/api/freshness/sources/list")
+async def list_freshness_sources() -> dict:
+    """
+    List all configured freshness sources.
+    
+    Returns the source configurations without checking their freshness status.
+    Useful for discovering available sources before querying them.
+    """
+    sources = get_enabled_sources()
+    return {
+        "total": len(sources),
+        "sources": [
+            {
+                "name": s.name,
+                "type": s.type.value,
+                "ttl_minutes": s.ttl_minutes,
+                "description": s.description,
+                "enabled": s.enabled,
+            }
+            for s in sources
+        ],
+    }
+
+
+@app.post("/api/freshness/reload")
+async def reload_freshness_config() -> dict:
+    """
+    Reload the freshness configuration from sources.yaml.
+    
+    Use this endpoint after modifying sources.yaml to apply changes
+    without restarting the service.
+    """
+    config = load_sources_config(force_reload=True)
+    return {
+        "status": "ok",
+        "message": "Configuration reloaded",
+        "sources_count": len(config.sources),
+    }
+
+
+# ============================================================================
 # Legacy Routes (for backward compatibility)
 # ============================================================================
 
@@ -666,7 +785,7 @@ class FreshnessReport(BaseModel):
     latency_seconds: float
 
 
-class FreshnessResponse(BaseModel):
+class LegacyFreshnessResponse(BaseModel):
     query: str
     mode: str
     reports: list[FreshnessReport]
@@ -694,8 +813,14 @@ async def root() -> dict:
     }
 
 
-@app.get("/freshness", response_model=FreshnessResponse)
-async def freshness(query: str = Query(..., min_length=1)) -> FreshnessResponse:
+@app.get("/freshness", response_model=LegacyFreshnessResponse)
+async def legacy_freshness(query: str = Query(..., min_length=1)) -> LegacyFreshnessResponse:
+    """
+    Legacy freshness endpoint for backward compatibility.
+    
+    Note: This endpoint is deprecated. Use /api/freshness for TTL-based
+    freshness checks or /api/chat for query-based responses.
+    """
     answer, mode, contexts = await ask_llm_async(query)
     reports = [_to_report(context) for context in contexts]
-    return FreshnessResponse(query=query, mode=mode, reports=reports, answer=answer)
+    return LegacyFreshnessResponse(query=query, mode=mode, reports=reports, answer=answer)
