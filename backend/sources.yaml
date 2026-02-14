@@ -1,0 +1,50 @@
+# Source Configuration for TTL-based Freshness Checks
+# Each source defines:
+#   - name: Unique identifier for the source
+#   - type: Source type (postgres, s3, api, file, archive)
+#   - ttl_minutes: Time-to-live in minutes before source is considered stale
+#   - connection: Type-specific connection parameters
+
+sources:
+  # Archive source - tracks freshness of locally archived web pages
+  - name: "web_archive"
+    type: "archive"
+    ttl_minutes: 1440  # 24 hours
+    description: "Locally archived web pages from Brave Search"
+
+  # Example: PostgreSQL database source
+  # - name: "user_login_db"
+  #   type: "postgres"
+  #   ttl_minutes: 30
+  #   connection:
+  #     host: "localhost"
+  #     port: 5432
+  #     database: "users"
+  #     table: "logins"
+  #     timestamp_column: "updated_at"
+
+  # Example: S3 bucket source
+  # - name: "daily_report_s3"
+  #   type: "s3"
+  #   ttl_minutes: 1440
+  #   connection:
+  #     bucket: "reports-bucket"
+  #     prefix: "daily/"
+  #     region: "us-east-1"
+
+  # Example: External API source
+  # - name: "weather_api"
+  #   type: "api"
+  #   ttl_minutes: 60
+  #   connection:
+  #     url: "https://api.weather.com/v1/current"
+  #     method: "HEAD"
+  #     headers:
+  #       Authorization: "Bearer ${WEATHER_API_KEY}"
+
+  # Example: Local file source
+  # - name: "config_file"
+  #   type: "file"
+  #   ttl_minutes: 5
+  #   connection:
+  #     path: "/etc/app/config.json"
