@@ -8,6 +8,7 @@ import { SourceInspector } from "./components/chat/source-inspector";
 import { ArchiveList } from "./components/archive/archive-list";
 import { ArchiveDetail } from "./components/archive/archive-detail";
 import { SettingsView } from "./components/settings/settings-view";
+import { Button } from "./components/ui/button";
 import type { Source, ArchiveEntry } from "./lib/types";
 
 // Create a client
@@ -35,6 +36,7 @@ function AppContent() {
     setActiveConversation,
     sendMessage,
     stopStreaming,
+    setPreferredMode,
   } = useChat();
   
   const handleSourceClick = (source: Source) => {
@@ -68,6 +70,29 @@ function AppContent() {
           <>
             {/* Chat Area */}
             <div className="flex-1 flex flex-col bg-white">
+              <div className="border-b border-gray-200 px-4 py-3">
+                <div className="mx-auto flex max-w-3xl items-center justify-between">
+                  <p className="text-sm font-medium text-gray-700">Chat mode</p>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={state.preferredMode === "ONLINE" ? "default" : "outline"}
+                      onClick={() => setPreferredMode("ONLINE")}
+                    >
+                      Online
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={state.preferredMode === "OFFLINE" ? "default" : "outline"}
+                      onClick={() => setPreferredMode("OFFLINE")}
+                    >
+                      Offline
+                    </Button>
+                  </div>
+                </div>
+              </div>
               <MessageList
                 turns={activeConversation?.turns || []}
                 onSourceClick={handleSourceClick}

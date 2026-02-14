@@ -8,6 +8,7 @@
 // ============================================================================
 
 export type RetrievalMode = "ONLINE" | "OFFLINE_ARCHIVE" | "LOCAL_WEIGHTS";
+export type PreferredChatMode = "ONLINE" | "OFFLINE";
 
 export type RetrievalType = "online" | "offline_keyword" | "offline_semantic";
 
@@ -34,6 +35,7 @@ export interface Source {
 export interface ChatRequest {
   query: string;
   conversation_id?: string;
+  prefer_mode?: PreferredChatMode;
 }
 
 export interface TimingInfo {

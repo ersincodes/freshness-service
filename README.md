@@ -62,9 +62,9 @@ pip install chromadb sentence-transformers
 ## Project Layout
 
 ```
-freshness_service/
+backend/
   __init__.py      # Package entry
-  __main__.py      # python -m freshness_service
+  __main__.py      # python -m backend
   config.py        # Environment-driven settings
   archive.py       # SQLite storage + offline retrieval (keyword)
   vector_store.py  # ChromaDB store + offline retrieval (semantic)
@@ -172,7 +172,7 @@ Deduplication:
 ## Running
 
 ```bash
-python -m freshness_service
+python -m backend
 ```
 
 Exit with `exit` or `quit`.
@@ -180,7 +180,7 @@ Exit with `exit` or `quit`.
 ## Running as an API
 
 ```bash
-uvicorn freshness_service.app:app --host 0.0.0.0 --port 8000
+uvicorn backend.app:app --host 0.0.0.0 --port 8000
 ```
 
 Example requests:
