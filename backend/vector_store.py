@@ -99,3 +99,134 @@ def query_similar(
     for doc, meta in zip(documents, metadatas):
         out.append((meta.get("url", ""), doc, meta.get("timestamp", "")))
     return out
+
+
+# ============================================================================
+# Document Chunks Collection
+# ============================================================================
+
+def get_document_chunks_collection(persist_dir: str, embed_model_name: str) -> Any:
+    """Get or create the document_chunks collection."""
+    _require_chromadb()
+    client = _build_client(persist_dir)
+    _ensure_tenant_database(client)
+    embed_fn = SentenceTransformerEmbeddingFunction(model_name=embed_model_name)
+    try:
+        return client.get_or_create_collection(
+            name="document_chunks",
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"},
+            tenant="default_tenant",
+            database="default_database",
+        )
+    except TypeError:
+        return client.get_or_create_collection(
+            name="document_chunks",
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+
+def upsert_document_chunk(
+    persist_dir: str,
+    embed_model_name: str,
+    chunk_id: str,
+    document_id: str,
+    filename: str,
+    content: str,
+    metadata: dict,
+    timestamp_iso: str,
+) -> None:
+    """Upsert a document chunk to the vector store."""
+    col = get_document_chunks_collection(persist_dir, embed_model_name)
+    
+    # Merge location metadata with standard fields
+    full_metadata = {
+        "document_id": document_id,
+        "filename": filename,
+        "timestamp": timestamp_iso,
+        "chunk_id": chunk_id,
+        **metadata,  # page, sheet, row_start, row_end
+    }
+    
+    col.upsert(
+        ids=[chunk_id],
+        documents=[content],
+        metadatas=[full_metadata],
+    )
+
+
+def delete_document_chunks_from_vector_store(
+    persist_dir: str,
+    embed_model_name: str,
+    document_id: str,
+) -> None:
+    """Delete all chunks for a document from the vector store."""
+    col = get_document_chunks_collection(persist_dir, embed_model_name)
+    
+    # Query to find all chunks for this document
+    try:
+        # Get all chunks with this document_id
+        results = col.get(
+            where={"document_id": document_id},
+            include=["metadatas"],
+        )
+        
+        if results and results.get("ids"):
+            col.delete(ids=results["ids"])
+    except Exception:
+        # If where clause fails, try alternative approach
+        pass
+
+
+def query_document_chunks_similar(
+    persist_dir: str,
+    embed_model_name: str,
+    query: str,
+    top_k: int = 5,
+    document_ids: list[str] | None = None,
+) -> list[tuple[str, str, str, dict, str]]:
+    """
+    Query similar document chunks.
+    
+    Returns: List of (chunk_id, document_id, content, metadata, filename) tuples
+    """
+    col = get_document_chunks_collection(persist_dir, embed_model_name)
+    
+    # Build where clause if filtering by document IDs
+    where_clause = None
+    if document_ids:
+        if len(document_ids) == 1:
+            where_clause = {"document_id": document_ids[0]}
+        else:
+            where_clause = {"document_id": {"$in": document_ids}}
+    
+    try:
+        if where_clause:
+            res: dict[str, Iterable] = col.query(
+                query_texts=[query],
+                n_results=top_k,
+                where=where_clause,
+            )
+        else:
+            res = col.query(query_texts=[query], n_results=top_k)
+    except Exception:
+        # Fallback without where clause
+        res = col.query(query_texts=[query], n_results=top_k)
+    
+    documents = res.get("documents", [[]])[0]
+    metadatas = res.get("metadatas", [[]])[0]
+    
+    out: list[tuple[str, str, str, dict, str]] = []
+    for doc, meta in zip(documents, metadatas):
+        chunk_id = meta.get("chunk_id", "")
+        document_id = meta.get("document_id", "")
+        filename = meta.get("filename", "")
+        # Extract location metadata
+        location_meta = {
+            k: v for k, v in meta.items()
+            if k in ("page", "sheet", "row_start", "row_end")
+        }
+        out.append((chunk_id, document_id, doc, location_meta, filename))
+    
+    return out

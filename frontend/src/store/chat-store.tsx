@@ -39,6 +39,10 @@ interface ChatState {
   isLoading: boolean;
   error: string | null;
   preferredMode: PreferredChatMode;
+  // Document integration options
+  includeWeb: boolean;
+  includeDocuments: boolean;
+  selectedDocumentIds: string[];
 }
 
 type ChatAction =
@@ -52,7 +56,10 @@ type ChatAction =
   | { type: "SET_LOADING"; payload: boolean }
   | { type: "SET_ERROR"; payload: string | null }
   | { type: "SET_PREFERRED_MODE"; payload: PreferredChatMode }
-  | { type: "CLEAR_CONVERSATION"; payload: string };
+  | { type: "CLEAR_CONVERSATION"; payload: string }
+  | { type: "SET_INCLUDE_WEB"; payload: boolean }
+  | { type: "SET_INCLUDE_DOCUMENTS"; payload: boolean }
+  | { type: "SET_SELECTED_DOCUMENT_IDS"; payload: string[] };
 
 // ============================================================================
 // Storage Keys
@@ -163,6 +170,15 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
       };
     }
 
+    case "SET_INCLUDE_WEB":
+      return { ...state, includeWeb: action.payload };
+
+    case "SET_INCLUDE_DOCUMENTS":
+      return { ...state, includeDocuments: action.payload };
+
+    case "SET_SELECTED_DOCUMENT_IDS":
+      return { ...state, selectedDocumentIds: action.payload };
+
     default:
       return state;
   }
@@ -182,6 +198,10 @@ interface ChatContextValue {
   stopStreaming: () => void;
   clearConversation: (id: string) => void;
   setPreferredMode: (mode: PreferredChatMode) => void;
+  // Document integration
+  setIncludeWeb: (include: boolean) => void;
+  setIncludeDocuments: (include: boolean) => void;
+  setSelectedDocumentIds: (ids: string[]) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -201,6 +221,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
     isLoading: false,
     error: null,
     preferredMode: "ONLINE",
+    includeWeb: true,
+    includeDocuments: false,
+    selectedDocumentIds: [],
   });
 
   // Use ref to always have access to latest state in async callbacks
@@ -252,6 +275,18 @@ export function ChatProvider({ children }: ChatProviderProps) {
 
   const setPreferredMode = useCallback((mode: PreferredChatMode) => {
     dispatch({ type: "SET_PREFERRED_MODE", payload: mode });
+  }, []);
+
+  const setIncludeWeb = useCallback((include: boolean) => {
+    dispatch({ type: "SET_INCLUDE_WEB", payload: include });
+  }, []);
+
+  const setIncludeDocuments = useCallback((include: boolean) => {
+    dispatch({ type: "SET_INCLUDE_DOCUMENTS", payload: include });
+  }, []);
+
+  const setSelectedDocumentIds = useCallback((ids: string[]) => {
+    dispatch({ type: "SET_SELECTED_DOCUMENT_IDS", payload: ids });
   }, []);
 
   // Send message
@@ -309,6 +344,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
               query: content,
               conversation_id: targetConversationId,
               prefer_mode: stateRef.current.preferredMode,
+              include_web: stateRef.current.includeWeb,
+              include_documents: stateRef.current.includeDocuments,
+              document_ids: stateRef.current.selectedDocumentIds.length > 0
+                ? stateRef.current.selectedDocumentIds
+                : undefined,
             },
             {
               onMeta: (data) => {
@@ -369,6 +409,11 @@ export function ChatProvider({ children }: ChatProviderProps) {
             query: content,
             conversation_id: targetConversationId,
             prefer_mode: stateRef.current.preferredMode,
+            include_web: stateRef.current.includeWeb,
+            include_documents: stateRef.current.includeDocuments,
+            document_ids: stateRef.current.selectedDocumentIds.length > 0
+              ? stateRef.current.selectedDocumentIds
+              : undefined,
           });
 
           dispatch({
@@ -423,6 +468,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
     stopStreaming,
     clearConversation,
     setPreferredMode,
+    setIncludeWeb,
+    setIncludeDocuments,
+    setSelectedDocumentIds,
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

@@ -1,9 +1,9 @@
-import { MessageSquare, Database, Settings, Plus, Trash2 } from "lucide-react";
+import { MessageSquare, Database, Settings, Plus, Trash2, FileText } from "lucide-react";
 import { Button } from "../ui/button";
 import { cn } from "../../lib/utils";
 import type { Conversation } from "../../lib/types";
 
-type View = "chat" | "archive" | "settings";
+type View = "chat" | "archive" | "documents" | "settings";
 
 interface SidebarProps {
   currentView: View;
@@ -26,6 +26,7 @@ export function Sidebar({
 }: SidebarProps) {
   const navItems: { id: View; label: string; icon: typeof MessageSquare }[] = [
     { id: "chat", label: "Chat", icon: MessageSquare },
+    { id: "documents", label: "Documents", icon: FileText },
     { id: "archive", label: "Archive", icon: Database },
     { id: "settings", label: "Settings", icon: Settings },
   ];

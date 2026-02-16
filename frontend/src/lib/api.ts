@@ -14,6 +14,9 @@ import type {
   ArchivePageResponse,
   SettingsResponse,
   HealthResponse,
+  Document,
+  DocumentListResponse,
+  DocumentUploadResponse,
 } from "./types";
 
 // ============================================================================
@@ -237,4 +240,49 @@ export async function getSettings(): Promise<SettingsResponse> {
 export async function getHealth(): Promise<HealthResponse> {
   const response = await fetch(`${API_BASE_URL}/api/health`);
   return handleResponse<HealthResponse>(response);
+}
+
+// ============================================================================
+// Documents API
+// ============================================================================
+
+/**
+ * Upload a document (PDF, XLSX, XLS) for processing.
+ */
+export async function uploadDocument(file: File): Promise<DocumentUploadResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  
+  const response = await fetch(`${API_BASE_URL}/api/documents/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  
+  return handleResponse<DocumentUploadResponse>(response);
+}
+
+/**
+ * List all uploaded documents.
+ */
+export async function listDocuments(): Promise<DocumentListResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/documents`);
+  return handleResponse<DocumentListResponse>(response);
+}
+
+/**
+ * Get status and details of a specific document.
+ */
+export async function getDocument(documentId: string): Promise<Document> {
+  const response = await fetch(`${API_BASE_URL}/api/documents/${documentId}`);
+  return handleResponse<Document>(response);
+}
+
+/**
+ * Delete a document and all its chunks.
+ */
+export async function deleteDocument(documentId: string): Promise<{ status: string; message: string }> {
+  const response = await fetch(`${API_BASE_URL}/api/documents/${documentId}`, {
+    method: "DELETE",
+  });
+  return handleResponse<{ status: string; message: string }>(response);
 }
