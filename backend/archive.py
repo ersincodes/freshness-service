@@ -58,6 +58,10 @@ def init_db(db_path: str) -> None:
         cur.execute(CREATE_ANSWERS)
         cur.execute(CREATE_SOURCE_METADATA)
         conn.commit()
+    
+    # Initialize document tables
+    from .documents import init_document_tables
+    init_document_tables(db_path)
 
 
 def save_to_archive(db_path: str, query: str, url: str, content: str) -> None:

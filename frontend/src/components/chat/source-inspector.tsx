@@ -1,4 +1,4 @@
-import { X, ExternalLink, Clock, Database, Globe, Search } from "lucide-react";
+import { X, ExternalLink, Clock, Database, Globe, Search, FileText } from "lucide-react";
 import { Button } from "../ui/button";
 import { Badge } from "../ui/badge";
 import type { Source } from "../../lib/types";
@@ -20,13 +20,17 @@ export function SourceInspector({ source, onClose }: SourceInspectorProps) {
     );
   }
   
-  const retrievalTypeConfig = {
-    online: { label: "Online", icon: Globe, variant: "success" as const },
-    offline_keyword: { label: "Keyword Search", icon: Search, variant: "warning" as const },
-    offline_semantic: { label: "Semantic Search", icon: Database, variant: "info" as const },
+  const isDocument = source.source_type === "document" || source.url.startsWith("doc://");
+  
+  const retrievalTypeConfig: Record<string, { label: string; icon: typeof Globe; variant: "success" | "warning" | "info" | "default" }> = {
+    online: { label: "Online", icon: Globe, variant: "success" },
+    offline_keyword: { label: "Keyword Search", icon: Search, variant: "warning" },
+    offline_semantic: { label: "Semantic Search", icon: Database, variant: "info" },
+    document_keyword: { label: "Document (Keyword)", icon: FileText, variant: "default" },
+    document_semantic: { label: "Document (Semantic)", icon: FileText, variant: "info" },
   };
   
-  const config = retrievalTypeConfig[source.retrieval_type];
+  const config = retrievalTypeConfig[source.retrieval_type] || retrievalTypeConfig.offline_keyword;
   const Icon = config.icon;
   
   return (
@@ -41,22 +45,43 @@ export function SourceInspector({ source, onClose }: SourceInspectorProps) {
       
       {/* Content */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {/* URL */}
-        <div>
-          <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
-            URL
-          </label>
-          <a
-            href={source.url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="mt-1 flex items-center gap-2 text-sm text-primary-600 hover:text-primary-700 break-all"
-          >
-            <ExternalLink className="h-4 w-4 flex-shrink-0" />
-            {extractDomain(source.url)}
-          </a>
-          <p className="mt-1 text-xs text-gray-400 break-all">{source.url}</p>
-        </div>
+        {/* Source Info */}
+        {isDocument ? (
+          <div>
+            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+              Document
+            </label>
+            <div className="mt-1 flex items-center gap-2 text-sm text-green-600">
+              <FileText className="h-4 w-4 flex-shrink-0" />
+              {source.filename || "Unknown Document"}
+            </div>
+            {source.location && (
+              <div className="mt-2 text-xs text-gray-500">
+                {source.location.page && <span className="mr-2">Page {source.location.page}</span>}
+                {source.location.sheet && <span className="mr-2">Sheet: {source.location.sheet}</span>}
+                {source.location.row_start && source.location.row_end && (
+                  <span>Rows {source.location.row_start}-{source.location.row_end}</span>
+                )}
+              </div>
+            )}
+          </div>
+        ) : (
+          <div>
+            <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+              URL
+            </label>
+            <a
+              href={source.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 flex items-center gap-2 text-sm text-primary-600 hover:text-primary-700 break-all"
+            >
+              <ExternalLink className="h-4 w-4 flex-shrink-0" />
+              {extractDomain(source.url)}
+            </a>
+            <p className="mt-1 text-xs text-gray-400 break-all">{source.url}</p>
+          </div>
+        )}
         
         {/* Retrieval Type */}
         <div>
@@ -106,19 +131,21 @@ export function SourceInspector({ source, onClose }: SourceInspectorProps) {
       </div>
       
       {/* Footer */}
-      <div className="p-4 border-t border-gray-200">
-        <a
-          href={source.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block"
-        >
-          <Button variant="outline" className="w-full gap-2">
-            <ExternalLink className="h-4 w-4" />
-            Open in Browser
-          </Button>
-        </a>
-      </div>
+      {!isDocument && (
+        <div className="p-4 border-t border-gray-200">
+          <a
+            href={source.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="block"
+          >
+            <Button variant="outline" className="w-full gap-2">
+              <ExternalLink className="h-4 w-4" />
+              Open in Browser
+            </Button>
+          </a>
+        </div>
+      )}
     </div>
   );
 }
