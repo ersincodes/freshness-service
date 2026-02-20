@@ -107,6 +107,14 @@ class SettingsResponse(BaseModel):
     request_timeout_s: int
     max_chars_per_source: int
     semantic_top_k: int
+    # Decoupled RAG settings
+    web_top_k: int
+    doc_semantic_top_k: int
+    doc_keyword_top_k: int
+    web_max_chars: int
+    doc_max_chars: int
+    total_context_budget: int
+    web_budget_fraction: float
 
 
 class HealthStatus(BaseModel):
@@ -130,6 +138,14 @@ class ConfigUpdate(BaseModel):
     lm_studio_base_url: str | None = None
     model_name: str | None = None
     brave_api_key: str | None = None
+    # Decoupled RAG settings
+    web_top_k: int | None = Field(None, ge=1)
+    doc_semantic_top_k: int | None = Field(None, ge=1)
+    doc_keyword_top_k: int | None = Field(None, ge=1)
+    web_max_chars: int | None = Field(None, ge=100)
+    doc_max_chars: int | None = Field(None, ge=0)
+    total_context_budget: int | None = Field(None, ge=1000)
+    web_budget_fraction: float | None = Field(None, ge=0.0, le=1.0)
 
 
 class DocumentResponse(BaseModel):
@@ -325,18 +341,49 @@ async def delete_document_endpoint(document_id: str) -> dict:
 @app.get("/api/settings", response_model=SettingsResponse)
 async def get_api_settings() -> SettingsResponse:
     s = get_settings()
-    return SettingsResponse(brave_api_key_set=bool(s.brave_api_key), lm_studio_base_url=s.lm_studio_base_url, model_name=s.model_name,
-                            offline_retrieval_mode=s.offline_retrieval_mode, max_search_results=s.max_search_results,
-                            request_timeout_s=s.request_timeout_s, max_chars_per_source=s.max_chars_per_source, semantic_top_k=s.semantic_top_k)
+    return SettingsResponse(
+        brave_api_key_set=bool(s.brave_api_key),
+        lm_studio_base_url=s.lm_studio_base_url,
+        model_name=s.model_name,
+        offline_retrieval_mode=s.offline_retrieval_mode,
+        max_search_results=s.max_search_results,
+        request_timeout_s=s.request_timeout_s,
+        max_chars_per_source=s.max_chars_per_source,
+        semantic_top_k=s.semantic_top_k,
+        web_top_k=s.web_top_k,
+        doc_semantic_top_k=s.doc_semantic_top_k,
+        doc_keyword_top_k=s.doc_keyword_top_k,
+        web_max_chars=s.web_max_chars,
+        doc_max_chars=s.doc_max_chars,
+        total_context_budget=s.total_context_budget,
+        web_budget_fraction=s.web_budget_fraction,
+    )
 
 
 @app.post("/api/config")
 async def update_config(payload: ConfigUpdate) -> dict:
     updates = {k: v for k, v in (payload.model_dump() if hasattr(payload, 'model_dump') else payload.dict()).items() if v is not None}
     u = update_settings(updates)
-    return {"status": "ok", "settings": {"lm_studio_base_url": u.lm_studio_base_url, "model_name": u.model_name, "max_search_results": u.max_search_results,
-            "offline_retrieval_mode": u.offline_retrieval_mode, "semantic_top_k": u.semantic_top_k, "request_timeout_s": u.request_timeout_s,
-            "max_chars_per_source": u.max_chars_per_source, "brave_api_key_set": bool(u.brave_api_key)}}
+    return {
+        "status": "ok",
+        "settings": {
+            "lm_studio_base_url": u.lm_studio_base_url,
+            "model_name": u.model_name,
+            "max_search_results": u.max_search_results,
+            "offline_retrieval_mode": u.offline_retrieval_mode,
+            "semantic_top_k": u.semantic_top_k,
+            "request_timeout_s": u.request_timeout_s,
+            "max_chars_per_source": u.max_chars_per_source,
+            "brave_api_key_set": bool(u.brave_api_key),
+            "web_top_k": u.web_top_k,
+            "doc_semantic_top_k": u.doc_semantic_top_k,
+            "doc_keyword_top_k": u.doc_keyword_top_k,
+            "web_max_chars": u.web_max_chars,
+            "doc_max_chars": u.doc_max_chars,
+            "total_context_budget": u.total_context_budget,
+            "web_budget_fraction": u.web_budget_fraction,
+        },
+    }
 
 
 @app.get("/api/health", response_model=HealthResponse)
