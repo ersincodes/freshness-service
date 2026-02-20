@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import re
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Any
@@ -30,6 +31,115 @@ class StreamEvent:
     data: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class RowIntent:
+    """Detected row-specific query intent."""
+    row_number: int
+    confidence: float
+
+
+@dataclass(frozen=True)
+class ColumnValueIntent:
+    """Detected column-value lookup intent (e.g., 'Index=1000')."""
+    column_name: str
+    value: str
+    confidence: float
+
+
+@dataclass(frozen=True)
+class QueryIntent:
+    """Parsed query intent for document retrieval."""
+    row_intent: RowIntent | None = None
+    filename_pattern: str | None = None
+    wants_last: bool = False
+    column_value: ColumnValueIntent | None = None
+
+
+_ROW_PATTERNS = [
+    (re.compile(r"\brow\s+(\d+)\b", re.IGNORECASE), 1.0),
+    (re.compile(r"#(\d+)\b"), 0.9),
+    (re.compile(r"\b(\d+)(?:st|nd|rd|th)\s+(?:row|customer|entry|record|item)\b", re.IGNORECASE), 0.95),
+    (re.compile(r"\b(?:customer|entry|record|item)\s+#?(\d+)\b", re.IGNORECASE), 0.85),
+]
+
+_COLUMN_VALUE_PATTERNS: list[tuple[re.Pattern, str]] = [
+    # "has/with VALUE in the COLUMN column/field" → value_first
+    (re.compile(r"(?:has|with|where)\s+(?:value\s+)?(\S+)\s+in\s+(?:the\s+)?(\w+)\s+(?:column|field)", re.IGNORECASE), "value_first"),
+    # "VALUE in the COLUMN column/field" (numeric value) → value_first
+    (re.compile(r"\b(\d[\d.]*)\s+in\s+(?:the\s+)?(\w+)\s+(?:column|field)", re.IGNORECASE), "value_first"),
+    # "COLUMN column/field is/equals VALUE" → column_first
+    (re.compile(r"\b(\w+)\s+(?:column|field)\s+(?:is|=|equals)\s+(\S+)", re.IGNORECASE), "column_first"),
+    # "where COLUMN is/equals VALUE" → column_first
+    (re.compile(r"where\s+(?:the\s+)?(\w+)\s+(?:is|=|equals)\s+(\S+)", re.IGNORECASE), "column_first"),
+    # "COLUMN VALUE" at end of fragment, e.g. "index 1000" → column_first
+    (re.compile(r"\b(index|id|code|number|num|no)\s+(\d+)\b", re.IGNORECASE), "column_first"),
+]
+
+_FILENAME_FROM_PATTERN = re.compile(
+    r"from\s+(?:the\s+)?['\"]?([a-zA-Z0-9_\-]+(?:-\d+)?(?:\.[a-zA-Z0-9]+)?)['\"]?\s*(?:file|document)?",
+    re.IGNORECASE
+)
+_FILENAME_IN_PATTERN = re.compile(
+    r"in\s+(?:the\s+)?['\"]?([a-zA-Z0-9_\-]+(?:-\d+)?(?:\.[a-zA-Z0-9]+)?)['\"]?\s+(?:file|document)",
+    re.IGNORECASE
+)
+
+_LAST_PATTERN = re.compile(r"\b(?:last|final|latest|most recent|bottom)\b", re.IGNORECASE)
+
+
+def _detect_filename(query: str) -> str | None:
+    """Extract filename from query, preferring 'from FILE' over 'in FILE file'."""
+    m = _FILENAME_FROM_PATTERN.search(query)
+    if m:
+        return m.group(1)
+    m = _FILENAME_IN_PATTERN.search(query)
+    return m.group(1) if m else None
+
+
+def detect_row_intent(query: str) -> RowIntent | None:
+    """Parse user query for row-specific addressing."""
+    for pattern, confidence in _ROW_PATTERNS:
+        match = pattern.search(query)
+        if match:
+            try:
+                row_num = int(match.group(1))
+                if row_num > 0:
+                    return RowIntent(row_number=row_num, confidence=confidence)
+            except ValueError:
+                continue
+    return None
+
+
+def detect_column_value_intent(query: str) -> ColumnValueIntent | None:
+    """Detect 'value V in column C' style lookups.
+    
+    Maps to the Header=Value format produced by _row_to_text, enabling
+    precise term search against chunk content.
+    """
+    for pattern, order in _COLUMN_VALUE_PATTERNS:
+        match = pattern.search(query)
+        if match:
+            if order == "value_first":
+                value, column = match.group(1), match.group(2)
+            else:
+                column, value = match.group(1), match.group(2)
+            return ColumnValueIntent(column_name=column, value=value, confidence=0.9)
+    return None
+
+
+def detect_query_intent(query: str) -> QueryIntent:
+    """Parse query for document retrieval hints (row, filename, last, column-value)."""
+    row_intent = detect_row_intent(query)
+    column_value = detect_column_value_intent(query)
+    filename_pattern = _detect_filename(query)
+    wants_last = bool(_LAST_PATTERN.search(query))
+    
+    return QueryIntent(
+        row_intent=row_intent, filename_pattern=filename_pattern,
+        wants_last=wants_last, column_value=column_value,
+    )
+
+
 class ChatService:
     """Service for RAG-based chat functionality."""
     
@@ -40,6 +150,74 @@ class ChatService:
         self._brave = brave_client
         self._archive = archive_repo
         self._docs = document_repo
+    
+    def _allocate_budget(
+        self, web_ctx: list[SourceContext], doc_ctx: list[SourceContext]
+    ) -> list[SourceContext]:
+        """Merge and prune contexts based on budget settings.
+        
+        Strategy:
+        1. Calculate web_limit (total * fraction) and doc_limit (remainder)
+        2. Truncate web_ctx items to web_max_chars; fit into web_limit
+        3. Give unused web budget to doc budget
+        4. Fit whole doc_ctx items into doc_limit when possible
+        5. If a chunk exceeds remaining budget but space remains, hard-truncate
+           it to fill the gap (guarantees at least partial context for oversized
+           legacy chunks that predate character-budgeted ingestion)
+        6. Return combined list
+        """
+        total_budget = self._s.total_context_budget
+        web_budget = int(total_budget * self._s.web_budget_fraction)
+        doc_budget = total_budget - web_budget
+        
+        result: list[SourceContext] = []
+        web_used = 0
+        
+        for ctx in web_ctx:
+            max_chars = self._s.web_max_chars
+            truncated_text = ctx.text[:max_chars] if max_chars > 0 else ctx.text
+            ctx_len = len(truncated_text)
+            
+            if web_used + ctx_len <= web_budget:
+                if truncated_text != ctx.text:
+                    ctx = SourceContext(
+                        ctx.url, truncated_text, ctx.timestamp_iso, ctx.is_fresh,
+                        ctx.latency_seconds, ctx.filename, ctx.metadata
+                    )
+                result.append(ctx)
+                web_used += ctx_len
+        
+        doc_budget += (web_budget - web_used)
+        
+        doc_used = 0
+        doc_max = self._s.doc_max_chars
+        min_useful = 200
+        
+        for ctx in doc_ctx:
+            remaining = doc_budget - doc_used
+            if remaining < min_useful:
+                break
+            
+            text = ctx.text if doc_max == 0 else ctx.text[:doc_max]
+            ctx_len = len(text)
+            
+            if ctx_len <= remaining:
+                if text != ctx.text:
+                    ctx = SourceContext(
+                        ctx.url, text, ctx.timestamp_iso, ctx.is_fresh,
+                        ctx.latency_seconds, ctx.filename, ctx.metadata
+                    )
+                result.append(ctx)
+                doc_used += ctx_len
+            else:
+                truncated = text[:remaining]
+                result.append(SourceContext(
+                    ctx.url, truncated, ctx.timestamp_iso, ctx.is_fresh,
+                    ctx.latency_seconds, ctx.filename, ctx.metadata
+                ))
+                doc_used += len(truncated)
+        
+        return result
     
     async def _fetch_source(self, query: str, url: str, fallback: str) -> SourceContext | None:
         start = time.perf_counter()
@@ -73,57 +251,163 @@ class ChatService:
         return [c for c in await asyncio.gather(*tasks) if c]
     
     async def _get_offline_context(self, query: str) -> list[SourceContext]:
+        top_k = self._s.web_top_k
         if self._s.offline_retrieval_mode == "semantic":
             try:
-                rows = await asyncio.to_thread(query_similar, self._s.chroma_dir, self._s.embed_model_name, query, self._s.semantic_top_k)
+                rows = await asyncio.to_thread(query_similar, self._s.chroma_dir, self._s.embed_model_name, query, top_k)
             except Exception:
-                rows = await self._archive.search_offline_async(query, self._s.semantic_top_k)
+                rows = await self._archive.search_offline_async(query, top_k)
         else:
-            rows = await self._archive.search_offline_async(query, self._s.semantic_top_k)
+            rows = await self._archive.search_offline_async(query, top_k)
         return [SourceContext(url, text[:self._s.max_chars_per_source], str(ts), False, 0.0) for url, text, ts in rows]
     
-    async def _get_document_context(self, query: str, doc_ids: list[str] | None = None) -> list[SourceContext]:
-        contexts = []
-        if self._s.offline_retrieval_mode == "semantic":
+    async def _get_document_context(
+        self, query: str, doc_ids: list[str] | None = None, intent: QueryIntent | None = None
+    ) -> list[SourceContext]:
+        """Hybrid document retrieval: column-value + filename + row-targeted + semantic + keyword with deduplication."""
+        seen_chunk_ids: set[str] = set()
+        all_chunks: list[tuple[str, str, str, dict, str, str, bool]] = []
+        
+        def _collect(chunks: list, targeted: bool = True) -> int:
+            added = 0
+            for c in chunks:
+                if c.chunk_id not in seen_chunk_ids:
+                    seen_chunk_ids.add(c.chunk_id)
+                    all_chunks.append((
+                        c.chunk_id, c.document_id, c.content, c.metadata,
+                        c.filename or "", c.timestamp, targeted
+                    ))
+                    added += 1
+            return added
+        
+        should_use_fallbacks = True
+        exact_hits = 0
+        
+        if intent and intent.column_value:
+            cv = intent.column_value
+            cv_terms = [f"{cv.column_name}={cv.value}"]
             try:
-                rows = await asyncio.to_thread(query_document_chunks_similar, self._s.chroma_dir, self._s.embed_model_name, query, self._s.semantic_top_k, doc_ids)
-                for chunk_id, doc_id, content, meta, filename in rows:
-                    loc = build_location_string(meta)
-                    contexts.append(SourceContext(f"{DOC_URL_PREFIX}{doc_id}", f"[{filename}] {loc}\n{content[:self._s.max_chars_per_source]}", dt.datetime.utcnow().isoformat(), False, 0.0, filename, meta))
-                return contexts
+                exact_hits += _collect(await self._docs.search_chunks_by_terms_async(
+                    cv_terms, doc_ids, limit=5
+                ), targeted=True)
             except Exception:
                 pass
-        chunks = await self._docs.search_chunks_keyword_async(query, doc_ids, self._s.semantic_top_k)
-        for c in chunks:
-            loc = build_location_string(c.metadata)
-            contexts.append(SourceContext(f"{DOC_URL_PREFIX}{c.document_id}", f"[{c.filename}] {loc}\n{c.content[:self._s.max_chars_per_source]}", c.timestamp, False, 0.0, c.filename, c.metadata))
+        
+        if intent and intent.filename_pattern:
+            filename_limit = 1 if intent.wants_last else self._s.doc_keyword_top_k
+            try:
+                _collect(await self._docs.search_chunks_by_filename_async(
+                    intent.filename_pattern, doc_ids, limit=filename_limit,
+                    last_chunks=intent.wants_last
+                ), targeted=True)
+            except Exception:
+                pass
+        
+        if intent and intent.row_intent:
+            row_terms = [f"Row {intent.row_intent.row_number}:", f"Row {intent.row_intent.row_number}"]
+            try:
+                exact_hits += _collect(await self._docs.search_chunks_by_terms_async(
+                    row_terms, doc_ids, limit=5
+                ), targeted=True)
+            except Exception:
+                pass
+        
+        if intent and ((intent.column_value and exact_hits > 0) or (intent.row_intent and exact_hits > 0) or (intent.wants_last and intent.filename_pattern)):
+            # Precision intents should not be diluted by broad semantic/keyword retrieval.
+            should_use_fallbacks = False
+        
+        if should_use_fallbacks and self._s.offline_retrieval_mode == "semantic":
+            try:
+                rows = await asyncio.to_thread(
+                    query_document_chunks_similar, self._s.chroma_dir, self._s.embed_model_name,
+                    query, self._s.doc_semantic_top_k, doc_ids
+                )
+                for chunk_id, doc_id, content, meta, filename in rows:
+                    if chunk_id not in seen_chunk_ids:
+                        seen_chunk_ids.add(chunk_id)
+                        all_chunks.append((
+                            chunk_id, doc_id, content, meta,
+                            filename or "", dt.datetime.utcnow().isoformat(), False
+                        ))
+            except Exception:
+                pass
+        
+        if should_use_fallbacks:
+            try:
+                _collect(await self._docs.search_chunks_keyword_async(
+                    query, doc_ids, self._s.doc_keyword_top_k
+                ), targeted=False)
+            except Exception:
+                pass
+        
+        if intent and intent.column_value:
+            cv_marker = f"{intent.column_value.column_name}={intent.column_value.value}"
+            all_chunks.sort(key=lambda x: (not x[6], cv_marker.lower() not in x[2].lower()))
+            if exact_hits > 0:
+                all_chunks = [x for x in all_chunks if cv_marker.lower() in x[2].lower()]
+        elif intent and intent.row_intent:
+            row_marker = f"Row {intent.row_intent.row_number}"
+            all_chunks.sort(key=lambda x: (not x[6], row_marker not in x[2]))
+            if exact_hits > 0:
+                all_chunks = [x for x in all_chunks if f"{row_marker}:" in x[2]]
+        
+        contexts = []
+        for chunk_id, doc_id, content, meta, filename, ts, is_row_match in all_chunks:
+            filtered_content = content
+            if intent and intent.column_value and exact_hits > 0:
+                cv_marker_lc = f"{intent.column_value.column_name}={intent.column_value.value}".lower()
+                matching_lines = [line for line in content.splitlines() if cv_marker_lc in line.lower()]
+                if matching_lines:
+                    filtered_content = "\n".join(matching_lines)
+            elif intent and intent.row_intent and exact_hits > 0:
+                row_prefix = f"Row {intent.row_intent.row_number}:"
+                matching_lines = [line for line in content.splitlines() if line.startswith(row_prefix)]
+                if matching_lines:
+                    filtered_content = "\n".join(matching_lines)
+            elif intent and intent.wants_last and intent.filename_pattern:
+                row_lines = [line for line in content.splitlines() if line.startswith("Row ")]
+                if row_lines:
+                    filtered_content = row_lines[-1]
+
+            loc = build_location_string(meta)
+            contexts.append(SourceContext(
+                f"{DOC_URL_PREFIX}{doc_id}",
+                f"[{filename}] {loc}\n{filtered_content}",
+                ts, False, 0.0, filename, meta
+            ))
+        
         return contexts
     
     async def _gather_contexts(self, query: str, prefer_mode: str | None, include_web: bool, include_docs: bool, doc_ids: list[str] | None) -> tuple[str, list[SourceContext]]:
-        all_ctx, mode = [], "LOCAL_WEIGHTS"
+        web_ctx: list[SourceContext] = []
+        doc_ctx: list[SourceContext] = []
+        mode = "LOCAL_WEIGHTS"
+        
         if include_web:
             if prefer_mode == "OFFLINE":
                 ctx = await self._get_offline_context(query)
                 if ctx:
-                    mode, all_ctx = "OFFLINE_ARCHIVE", ctx
+                    mode, web_ctx = "OFFLINE_ARCHIVE", ctx
             elif prefer_mode == "ONLINE":
                 ctx = await self._get_online_context(query)
                 if ctx:
-                    mode, all_ctx = "ONLINE", ctx
+                    mode, web_ctx = "ONLINE", ctx
             else:
                 ctx = await self._get_online_context(query)
                 if ctx:
-                    mode, all_ctx = "ONLINE", ctx
+                    mode, web_ctx = "ONLINE", ctx
                 else:
                     ctx = await self._get_offline_context(query)
                     if ctx:
-                        mode, all_ctx = "OFFLINE_ARCHIVE", ctx
+                        mode, web_ctx = "OFFLINE_ARCHIVE", ctx
+        
         if include_docs:
-            doc_ctx = await self._get_document_context(query, doc_ids)
-            if doc_ctx:
-                all_ctx.extend(doc_ctx)
-                if not include_web or mode == "LOCAL_WEIGHTS":
-                    mode = "OFFLINE_ARCHIVE"
+            intent = detect_query_intent(query)
+            doc_ctx = await self._get_document_context(query, doc_ids, intent)
+            if doc_ctx and (not include_web or mode == "LOCAL_WEIGHTS"):
+                mode = "OFFLINE_ARCHIVE"
+        
+        all_ctx = self._allocate_budget(web_ctx, doc_ctx)
         return (mode, all_ctx) if all_ctx else ("LOCAL_WEIGHTS", [SourceContext.create_fallback()])
     
     def _extraction_prompt(self, contexts: list[SourceContext]) -> str:

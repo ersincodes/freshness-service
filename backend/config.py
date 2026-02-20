@@ -23,6 +23,16 @@ def _getenv_int(name: str, default: int) -> int:
         return default
 
 
+def _getenv_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _normalize_mode(raw: str | None) -> str:
     value = (raw or "keyword").strip().lower()
     return value if value in {"keyword", "semantic"} else "keyword"
@@ -44,6 +54,14 @@ class Settings:
     # Document upload settings
     upload_dir: str
     max_upload_mb: int
+    # Decoupled RAG settings
+    web_top_k: int
+    doc_semantic_top_k: int
+    doc_keyword_top_k: int
+    web_max_chars: int
+    doc_max_chars: int
+    total_context_budget: int
+    web_budget_fraction: float
 
 
 settings = Settings(
@@ -62,6 +80,14 @@ settings = Settings(
     max_chars_per_source=_getenv_int("MAX_CHARS_PER_SOURCE", 2000),
     upload_dir=os.getenv("UPLOAD_DIR", "uploads"),
     max_upload_mb=_getenv_int("MAX_UPLOAD_MB", 25),
+    # Decoupled RAG settings
+    web_top_k=_getenv_int("WEB_TOP_K", 3),
+    doc_semantic_top_k=_getenv_int("DOC_SEMANTIC_TOP_K", 12),
+    doc_keyword_top_k=_getenv_int("DOC_KEYWORD_TOP_K", 20),
+    web_max_chars=_getenv_int("WEB_MAX_CHARS", 2000),
+    doc_max_chars=_getenv_int("DOC_MAX_CHARS", 0),
+    total_context_budget=_getenv_int("TOTAL_CONTEXT_BUDGET", 14000),
+    web_budget_fraction=_getenv_float("WEB_BUDGET_FRACTION", 0.4),
 )
 
 _RUNTIME_OVERRIDES: dict[str, Any] = {}
@@ -97,23 +123,48 @@ def get_settings() -> Settings:
         ),
         upload_dir=_RUNTIME_OVERRIDES.get("upload_dir", base.upload_dir),
         max_upload_mb=_RUNTIME_OVERRIDES.get("max_upload_mb", base.max_upload_mb),
+        web_top_k=_RUNTIME_OVERRIDES.get("web_top_k", base.web_top_k),
+        doc_semantic_top_k=_RUNTIME_OVERRIDES.get(
+            "doc_semantic_top_k", base.doc_semantic_top_k
+        ),
+        doc_keyword_top_k=_RUNTIME_OVERRIDES.get(
+            "doc_keyword_top_k", base.doc_keyword_top_k
+        ),
+        web_max_chars=_RUNTIME_OVERRIDES.get("web_max_chars", base.web_max_chars),
+        doc_max_chars=_RUNTIME_OVERRIDES.get("doc_max_chars", base.doc_max_chars),
+        total_context_budget=_RUNTIME_OVERRIDES.get(
+            "total_context_budget", base.total_context_budget
+        ),
+        web_budget_fraction=_RUNTIME_OVERRIDES.get(
+            "web_budget_fraction", base.web_budget_fraction
+        ),
     )
 
 
 def update_settings(overrides: dict[str, Any]) -> Settings:
     normalized: dict[str, Any] = {}
+    int_keys = {
+        "max_search_results",
+        "semantic_top_k",
+        "request_timeout_s",
+        "max_chars_per_source",
+        "web_top_k",
+        "doc_semantic_top_k",
+        "doc_keyword_top_k",
+        "web_max_chars",
+        "doc_max_chars",
+        "total_context_budget",
+    }
+    float_keys = {"web_budget_fraction"}
     for key, value in overrides.items():
         if value is None:
             continue
         if key == "offline_retrieval_mode":
             normalized[key] = _normalize_mode(str(value))
-        elif key in {
-            "max_search_results",
-            "semantic_top_k",
-            "request_timeout_s",
-            "max_chars_per_source",
-        }:
+        elif key in int_keys:
             normalized[key] = int(value)
+        elif key in float_keys:
+            normalized[key] = float(value)
         else:
             normalized[key] = value
     _RUNTIME_OVERRIDES.update(normalized)

@@ -132,9 +132,29 @@ class DocumentRepository:
                 )
             conn.commit()
     
+    _STOP_WORDS = frozenset({
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
+        "of", "with", "by", "from", "is", "it", "its", "that", "this",
+        "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may",
+        "can", "you", "me", "my", "your", "who", "what", "how", "where",
+        "when", "which", "give", "get", "tell", "show", "find", "please",
+    })
+
     def search_chunks_keyword(self, query: str, document_ids: list[str] | None = None, top_k: int = 5) -> list[DocumentChunk]:
-        """Search chunks by keyword."""
-        term = f"%{query.lower()}%"
+        """Search chunks by keyword tokens with OR logic.
+        
+        Tokenizes the query and matches individual terms rather than the
+        full sentence, which would never appear as a substring in data chunks.
+        """
+        tokens = [t for t in query.lower().split() if len(t) > 2 and t not in self._STOP_WORDS]
+        if not tokens:
+            tokens = [query.lower().strip()]
+        tokens = tokens[:10]
+
+        like_clauses = " OR ".join("LOWER(dc.content) LIKE ?" for _ in tokens)
+        like_params = [f"%{t}%" for t in tokens]
+
         with self._conn() as conn:
             cur = conn.cursor()
             if document_ids:
@@ -142,17 +162,78 @@ class DocumentRepository:
                 cur.execute(
                     f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
                         FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE dc.document_id IN ({placeholders}) AND (LOWER(dc.content) LIKE ? OR LOWER(d.filename) LIKE ?)
-                        ORDER BY dc.timestamp DESC LIMIT ?""",
-                    (*document_ids, term, term, top_k),
+                        WHERE dc.document_id IN ({placeholders}) AND ({like_clauses})
+                        ORDER BY dc.chunk_index ASC LIMIT ?""",
+                    (*document_ids, *like_params, top_k),
                 )
             else:
                 cur.execute(
-                    """SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                       WHERE d.status = 'ready' AND (LOWER(dc.content) LIKE ? OR LOWER(d.filename) LIKE ?)
-                       ORDER BY dc.timestamp DESC LIMIT ?""",
-                    (term, term, top_k),
+                       WHERE d.status = 'ready' AND ({like_clauses})
+                       ORDER BY dc.chunk_index ASC LIMIT ?""",
+                    (*like_params, top_k),
+                )
+            rows = cur.fetchall()
+        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+    
+    def search_chunks_by_terms(
+        self, terms: list[str], document_ids: list[str] | None = None, limit: int = 10
+    ) -> list[DocumentChunk]:
+        """Search chunks for multiple row-target terms (OR logic)."""
+        if not terms:
+            return []
+        
+        like_clauses = " OR ".join("dc.content LIKE ?" for _ in terms)
+        like_params = [f"%{t}%" for t in terms]
+        
+        with self._conn() as conn:
+            cur = conn.cursor()
+            if document_ids:
+                doc_placeholders = ",".join("?" for _ in document_ids)
+                cur.execute(
+                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
+                        WHERE dc.document_id IN ({doc_placeholders}) AND ({like_clauses})
+                        ORDER BY dc.chunk_index ASC LIMIT ?""",
+                    (*document_ids, *like_params, limit),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
+                        WHERE d.status = 'ready' AND ({like_clauses})
+                        ORDER BY dc.chunk_index ASC LIMIT ?""",
+                    (*like_params, limit),
+                )
+            rows = cur.fetchall()
+        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+    
+    def search_chunks_by_filename(
+        self, filename_pattern: str, document_ids: list[str] | None = None, limit: int = 10, last_chunks: bool = False
+    ) -> list[DocumentChunk]:
+        """Search chunks by filename pattern. Optionally get last chunks (highest chunk_index)."""
+        term = f"%{filename_pattern.lower()}%"
+        order = "dc.chunk_index DESC" if last_chunks else "dc.chunk_index ASC"
+        
+        with self._conn() as conn:
+            cur = conn.cursor()
+            if document_ids:
+                doc_placeholders = ",".join("?" for _ in document_ids)
+                cur.execute(
+                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
+                        WHERE dc.document_id IN ({doc_placeholders}) AND LOWER(d.filename) LIKE ?
+                        ORDER BY {order} LIMIT ?""",
+                    (*document_ids, term, limit),
+                )
+            else:
+                cur.execute(
+                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
+                        WHERE d.status = 'ready' AND LOWER(d.filename) LIKE ?
+                        ORDER BY {order} LIMIT ?""",
+                    (term, limit),
                 )
             rows = cur.fetchall()
         return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
@@ -190,3 +271,13 @@ class DocumentRepository:
     
     async def search_chunks_keyword_async(self, query: str, document_ids: list[str] | None = None, top_k: int = 5) -> list[DocumentChunk]:
         return await asyncio.to_thread(self.search_chunks_keyword, query, document_ids, top_k)
+    
+    async def search_chunks_by_terms_async(
+        self, terms: list[str], document_ids: list[str] | None = None, limit: int = 10
+    ) -> list[DocumentChunk]:
+        return await asyncio.to_thread(self.search_chunks_by_terms, terms, document_ids, limit)
+    
+    async def search_chunks_by_filename_async(
+        self, filename_pattern: str, document_ids: list[str] | None = None, limit: int = 10, last_chunks: bool = False
+    ) -> list[DocumentChunk]:
+        return await asyncio.to_thread(self.search_chunks_by_filename, filename_pattern, document_ids, limit, last_chunks)

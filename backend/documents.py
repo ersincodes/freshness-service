@@ -259,19 +259,92 @@ def extract_xls_data(file_path: str) -> list[tuple[str, list[list[Any]]]]:
 
 
 def _row_to_text(row: list[Any], headers: list[Any] | None = None) -> str:
-    """Convert a row to text representation."""
+    """Convert a row to text representation with lossless column mapping.
+    
+    Handles cases where row has more columns than headers by generating
+    synthetic column names for overflow columns.
+    """
     if headers:
         parts = []
-        for header, value in zip(headers, row):
+        header_count = len(headers)
+        for i, value in enumerate(row):
             if value is not None and str(value).strip():
-                header_str = str(header) if header else f"Col{len(parts)+1}"
+                if i < header_count:
+                    header_str = str(headers[i]) if headers[i] else f"Col{i+1}"
+                else:
+                    header_str = f"Col{i+1}"
                 parts.append(f"{header_str}={value}")
         return ", ".join(parts)
     return ", ".join(str(v) for v in row if v is not None and str(v).strip())
 
 
+def chunk_excel_by_budget(
+    sheets: list[tuple[str, list[list[Any]]]], char_budget: int = 3500
+) -> list[DocumentChunk]:
+    """Chunk Excel sheets using character-based budgeting.
+    
+    Iterates through rows and accumulates them into chunks until the
+    character budget is reached, then starts a new chunk. This prevents
+    silent row loss that can occur with fixed row counts.
+    """
+    chunks: list[DocumentChunk] = []
+    chunk_index = 0
+    
+    for sheet_name, rows in sheets:
+        if not rows:
+            continue
+        
+        headers = rows[0] if rows else None
+        data_rows = rows[1:] if headers else rows
+        
+        current_lines: list[str] = []
+        current_length = 0
+        chunk_row_start: int | None = None
+        chunk_row_end: int | None = None
+        
+        for i, row in enumerate(data_rows):
+            row_num = i + 2 if headers else i + 1
+            row_text = _row_to_text(row, headers)
+            if not row_text:
+                continue
+            
+            line = f"Row {row_num}: {row_text}"
+            line_len = len(line) + 1
+            
+            if current_length + line_len > char_budget and current_lines:
+                chunks.append(DocumentChunk(
+                    chunk_index=chunk_index,
+                    content="\n".join(current_lines),
+                    metadata={"sheet": sheet_name, "row_start": chunk_row_start, "row_end": chunk_row_end},
+                ))
+                chunk_index += 1
+                current_lines = []
+                current_length = 0
+                chunk_row_start = None
+            
+            current_lines.append(line)
+            current_length += line_len
+            if chunk_row_start is None:
+                chunk_row_start = row_num
+            chunk_row_end = row_num
+        
+        if current_lines:
+            chunks.append(DocumentChunk(
+                chunk_index=chunk_index,
+                content="\n".join(current_lines),
+                metadata={"sheet": sheet_name, "row_start": chunk_row_start, "row_end": chunk_row_end},
+            ))
+            chunk_index += 1
+    
+    return chunks
+
+
 def chunk_excel_sheets(sheets: list[tuple[str, list[list[Any]]]], rows_per_chunk: int = 50) -> list[DocumentChunk]:
-    """Chunk Excel sheets into smaller pieces with sheet/row metadata."""
+    """Chunk Excel sheets into smaller pieces with sheet/row metadata.
+    
+    DEPRECATED: Use chunk_excel_by_budget for character-based chunking
+    that prevents silent row loss.
+    """
     chunks: list[DocumentChunk] = []
     chunk_index = 0
     
@@ -312,17 +385,24 @@ def process_document(
     file_path: str,
     doc_type: DocumentType,
     chunk_size: int = 2000,
-    rows_per_chunk: int = 50,
+    excel_char_budget: int = 3500,
 ) -> list[DocumentChunk]:
-    """Process a document and return chunks."""
+    """Process a document and return chunks.
+    
+    Args:
+        file_path: Path to the document file.
+        doc_type: Type of document (PDF, XLSX, XLS).
+        chunk_size: Character budget for PDF chunks.
+        excel_char_budget: Character budget for Excel chunks (prevents row loss).
+    """
     if doc_type == DocumentType.PDF:
         pages = extract_pdf_text(file_path)
         return chunk_pdf_pages(pages, chunk_size)
     elif doc_type == DocumentType.XLSX:
         sheets = extract_xlsx_data(file_path)
-        return chunk_excel_sheets(sheets, rows_per_chunk)
+        return chunk_excel_by_budget(sheets, excel_char_budget)
     elif doc_type == DocumentType.XLS:
         sheets = extract_xls_data(file_path)
-        return chunk_excel_sheets(sheets, rows_per_chunk)
+        return chunk_excel_by_budget(sheets, excel_char_budget)
     else:
         raise ValueError(f"Unsupported document type: {doc_type}")
