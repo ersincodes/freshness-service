@@ -8,8 +8,12 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
+import os
+import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import AsyncGenerator, Literal
 
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File, BackgroundTasks
@@ -19,14 +23,16 @@ from pydantic import BaseModel, Field
 
 from .config import get_settings, update_settings
 from .domain import ErrorCode, SourceContext
-from .repositories import ArchiveRepository, DocumentRepository
+from .repositories import ArchiveRepository, DocumentRepository, AnalyticsRepository
 from .repositories.document_repository import DocumentInfo
-from .documents import DocumentType, DocumentStatus, generate_document_id, get_document_type_from_filename, validate_mime_type, sanitize_filename, process_document, hash_chunk_id
+from .documents import DocumentType, DocumentStatus, generate_document_id, get_document_type_from_filename, validate_mime_type, sanitize_filename, process_document, hash_chunk_id, ingest_excel_to_sqlite
 from .integrations import LLMClient, BraveClient
 from .services import ChatService, HealthService
 from .freshness import FreshnessReportResponse, SingleSourceFreshnessResponse, FreshnessStatus, check_all_sources_freshness, check_source_freshness, get_source_by_name, get_enabled_sources, load_sources_config
 from .vector_store import upsert_document_chunk, delete_document_chunks_from_vector_store
 from . import archive
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Freshness Service", version="1.0.0", docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -186,8 +192,14 @@ def _doc_repo() -> DocumentRepository:
 
 def _chat_service() -> ChatService:
     s = get_settings()
-    return ChatService(s, LLMClient(s.lm_studio_base_url, s.model_name, s.request_timeout_s),
-                       BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results), _archive_repo(), _doc_repo())
+    return ChatService(
+        s,
+        LLMClient(s.lm_studio_base_url, s.model_name, s.request_timeout_s),
+        BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results),
+        _archive_repo(),
+        _doc_repo(),
+        analytics_repo=_analytics_repo(),
+    )
 
 
 def _health_service() -> HealthService:
@@ -208,12 +220,90 @@ def _doc_to_response(d: DocumentInfo) -> DocumentResponse:
 
 
 # ============================================================================
-# Startup
+# Migrations + Startup
 # ============================================================================
+
+def _run_analytics_migrations(db_path: str) -> None:
+    """Execute SQL migration files for tabular analytics schema."""
+    migration_file = Path(__file__).parent / "migrations" / "001_tabular_analytics.sql"
+    if not migration_file.exists():
+        logger.warning("Analytics migration file not found: %s", migration_file)
+        return
+    sql = migration_file.read_text(encoding="utf-8")
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(sql)
+    logger.info("Analytics migrations applied from %s", migration_file.name)
+
+
+def _get_analytics_connection(db_path: str) -> sqlite3.Connection:
+    """Return a long-lived SQLite connection for analytics operations."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+
+_analytics_conn: sqlite3.Connection | None = None
+
+
+def _analytics_repo() -> AnalyticsRepository | None:
+    if _analytics_conn is None:
+        return None
+    return AnalyticsRepository(_analytics_conn)
+
+
+def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
+    """Ingest any existing Excel documents that are missing from analytics tables.
+
+    File naming convention: uploads/{document_id}_{filename}
+    """
+    conn = _get_analytics_connection(db_path)
+    repo = AnalyticsRepository(conn)
+    already_ingested = set(repo.list_all_document_ids())
+
+    doc_repo = DocumentRepository(db_path, upload_dir)
+    all_docs = doc_repo.list_documents()
+    excel_types = {DocumentType.XLSX, DocumentType.XLS}
+    ingested_count = 0
+
+    for doc in all_docs:
+        if doc.doc_type not in excel_types:
+            continue
+        if doc.status != DocumentStatus.READY:
+            continue
+        if doc.document_id in already_ingested:
+            continue
+
+        file_path = os.path.join(upload_dir, f"{doc.document_id}_{doc.filename}")
+        if not os.path.isfile(file_path):
+            logger.warning("Retroactive ingestion: file not found at %s", file_path)
+            continue
+
+        try:
+            ingest_excel_to_sqlite(
+                excel_path=file_path,
+                document_id=doc.document_id,
+                sqlite_connection=conn,
+            )
+            ingested_count += 1
+            logger.warning("Retroactively ingested analytics for document %s (%s)", doc.document_id, doc.filename)
+        except Exception as exc:
+            logger.warning("Retroactive ingestion failed for %s: %s", doc.document_id, exc)
+
+    if ingested_count:
+        logger.warning("Retroactive analytics ingestion complete: %d document(s)", ingested_count)
+
+    conn.close()
+
 
 @app.on_event("startup")
 async def startup() -> None:
-    archive.init_db(get_settings().db_path)
+    global _analytics_conn
+    s = get_settings()
+    archive.init_db(s.db_path)
+    _run_analytics_migrations(s.db_path)
+    if s.enable_tabular_analytics:
+        _retroactive_analytics_ingestion(s.db_path, s.upload_dir)
+        _analytics_conn = _get_analytics_connection(s.db_path)
 
 
 # ============================================================================
@@ -280,6 +370,19 @@ async def _process_doc_bg(doc_id: str, file_path: str, doc_type_val: str, filena
                     await asyncio.to_thread(upsert_document_chunk, s.chroma_dir, s.embed_model_name, hash_chunk_id(doc_id, c.chunk_index), doc_id, filename, c.content, c.metadata, dt.datetime.utcnow().isoformat())
                 except Exception:
                     pass
+
+        if s.enable_tabular_analytics and doc_type in {DocumentType.XLSX, DocumentType.XLS}:
+            try:
+                conn = _get_analytics_connection(s.db_path)
+                await asyncio.to_thread(
+                    ingest_excel_to_sqlite,
+                    excel_path=file_path,
+                    document_id=doc_id,
+                    sqlite_connection=conn,
+                )
+            except Exception as exc:
+                logger.warning("Tabular analytics ingestion failed for %s: %s", doc_id, exc)
+
         await repo.update_status_async(doc_id, DocumentStatus.READY)
     except Exception as e:
         await repo.update_status_async(doc_id, DocumentStatus.ERROR, str(e))

@@ -1,21 +1,35 @@
 """
-Chat service for RAG-based question answering.
+Chat service for RAG-based question answering with deterministic analytics path.
 """
 from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
+import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Any
 
+from pydantic import TypeAdapter, ValidationError
+
+from ..analytics.errors import AnalyticsError
+from ..analytics.executor import AnalyticsExecutor
+from ..analytics.models import AnalyticsPlan, AnalyticsResult
+from ..analytics.router import AnalyticsRouter
 from ..config import Settings
 from ..domain import SourceContext, build_context_string, build_location_string, determine_retrieval_type, context_to_source_dict, DOC_URL_PREFIX, FALLBACK_SOURCE_URL, ErrorCode
 from ..integrations import LLMClient, BraveClient
 from ..repositories import ArchiveRepository, DocumentRepository
+from ..repositories.analytics_repository import AnalyticsRepository
 from ..scraper import get_clean_text
 from ..vector_store import query_similar, upsert_page, query_document_chunks_similar
+
+logger = logging.getLogger(__name__)
+
+_ANALYTICS_PLAN_ADAPTER: TypeAdapter[AnalyticsPlan] = TypeAdapter(AnalyticsPlan)
 
 
 @dataclass(frozen=True)
@@ -141,16 +155,144 @@ def detect_query_intent(query: str) -> QueryIntent:
 
 
 class ChatService:
-    """Service for RAG-based chat functionality."""
+    """Service for RAG-based chat functionality with analytics path."""
     
-    def __init__(self, settings: Settings, llm_client: LLMClient, brave_client: BraveClient,
-                 archive_repo: ArchiveRepository, document_repo: DocumentRepository) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        llm_client: LLMClient,
+        brave_client: BraveClient,
+        archive_repo: ArchiveRepository,
+        document_repo: DocumentRepository,
+        analytics_repo: AnalyticsRepository | None = None,
+    ) -> None:
         self._s = settings
         self._llm = llm_client
         self._brave = brave_client
         self._archive = archive_repo
         self._docs = document_repo
+        self._analytics_router = AnalyticsRouter()
+        self._analytics_executor = AnalyticsExecutor(analytics_repo) if analytics_repo else None
     
+    # ------------------------------------------------------------------
+    # Analytics path
+    # ------------------------------------------------------------------
+
+    def _can_use_analytics(self) -> bool:
+        return (
+            self._s.enable_tabular_analytics
+            and self._analytics_executor is not None
+        )
+
+    def _parse_analytics_plan_json(self, plan_json_text: str) -> AnalyticsPlan:
+        """Validate raw JSON text from the LLM into a typed AnalyticsPlan."""
+        raw = plan_json_text.strip()
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            start, end = raw.find("{"), raw.rfind("}")
+            if start != -1 and end > start:
+                obj = json.loads(raw[start : end + 1])
+            else:
+                raise
+        return _ANALYTICS_PLAN_ADAPTER.validate_python(obj)
+
+    def _build_analytics_system_prompt(
+        self,
+        column_names: list[str],
+        document_id: str,
+        column_types: dict[str, str] | None = None,
+    ) -> str:
+        if column_types:
+            cols_block = "\n".join(
+                f"  - {c} (type: {column_types.get(c, 'text')})" for c in column_names
+            )
+        else:
+            cols_block = "\n".join(f"  - {c}" for c in column_names)
+        return (
+            "You are a deterministic analytics planner. "
+            "You translate user questions about a spreadsheet into a JSON plan.\n\n"
+            "RULES:\n"
+            "1. Output ONLY valid JSON — no markdown fences, no commentary.\n"
+            "2. The JSON must match one of these schemas (discriminated by 'type'):\n"
+            '   a) {"type":"count_rows","table":{"document_id":"..."},"where":[...]}\n'
+            '   b) {"type":"count_distinct","table":{"document_id":"..."},"column":"...","where":[...]}\n'
+            '   c) {"type":"groupby_count","table":{"document_id":"..."},"group_by":"...","where":[...],'
+            '"order":"count_desc","top_n":50}\n'
+            "3. 'where' is a list of predicates: "
+            '{"column":"...","op":"=|!=|<|<=|>|>=|contains|startswith|endswith|is_null|is_not_null","value":"..."}\n'
+            "4. Columns must be ORIGINAL Excel header names from the list below.\n"
+            "5. table.document_id must be: " + json.dumps(document_id) + "\n"
+            "6. Date columns are stored as TEXT in 'YYYY-MM-DD' format. "
+            "To filter by year use the 'startswith' operator (e.g. value='2020'). "
+            "To filter by month use 'startswith' with 'YYYY-MM'. "
+            "NEVER use <= with a date boundary; prefer 'startswith' for partial-date matching "
+            "or use >= with < on the next period start.\n\n"
+            "AVAILABLE COLUMNS:\n" + cols_block
+        )
+
+    async def _generate_analytics_plan(
+        self, *, user_query: str, document_id: str
+    ) -> AnalyticsPlan | None:
+        """Ask the LLM to produce a restricted JSON plan, then validate it."""
+        if self._analytics_executor is None:
+            return None
+
+        repo = self._analytics_executor._repo
+        sheet_name = repo.resolve_default_sheet_name(document_id)
+        if sheet_name is None:
+            return None
+
+        mappings = repo.fetch_column_mappings(document_id, sheet_name)
+        if not mappings:
+            return None
+
+        column_names = [m.original_name for m in mappings if not m.original_name.startswith("_")]
+        column_types = {m.original_name: m.inferred_type for m in mappings if not m.original_name.startswith("_")}
+        system_prompt = self._build_analytics_system_prompt(column_names, document_id, column_types)
+
+        try:
+            resp = await self._llm.complete(system_prompt, user_query, temperature=0.0)
+            plan = self._parse_analytics_plan_json(resp.content)
+            return plan
+        except (json.JSONDecodeError, ValidationError, Exception) as exc:
+            logger.warning("Analytics plan generation/validation failed: %s", exc)
+            return None
+
+    async def _try_analytics(
+        self, query: str, doc_ids: list[str] | None
+    ) -> AnalyticsResult | None:
+        """Attempt the full analytics path: route → plan → compile → execute."""
+        if not self._can_use_analytics():
+            return None
+
+        decision = self._analytics_router.decide(query)
+        if not decision.use_analytics:
+            return None
+
+        effective_ids = doc_ids
+        if not effective_ids and self._analytics_executor is not None:
+            effective_ids = self._analytics_executor._repo.list_all_document_ids()
+        if not effective_ids:
+            return None
+
+        for doc_id in effective_ids:
+            try:
+                plan = await self._generate_analytics_plan(user_query=query, document_id=doc_id)
+                if plan is None:
+                    continue
+                result = await asyncio.to_thread(self._analytics_executor.execute, plan)
+                return result
+            except AnalyticsError as exc:
+                logger.warning("Analytics execution failed for doc %s: %s", doc_id, exc)
+                continue
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Budget allocation
+    # ------------------------------------------------------------------
+
     def _allocate_budget(
         self, web_ctx: list[SourceContext], doc_ctx: list[SourceContext]
     ) -> list[SourceContext]:
@@ -418,6 +560,16 @@ class ChatService:
         return f"You are a helpful AI that answers ONLY from provided context.\nCurrent Mode: {mode}\nInstructions: Use the provided context to answer. If the context is empty or does not contain the exact answer, say you could not verify it.\nAlways cite the source for factual claims.\n{sec}\nCONTEXT:\n{build_context_string(contexts)}"
     
     async def get_answer(self, query: str, prefer_mode: str | None = None, include_web: bool = True, include_documents: bool = False, document_ids: list[str] | None = None) -> ChatResult:
+        if include_documents:
+            analytics_result = await self._try_analytics(query, document_ids)
+            if analytics_result is not None:
+                answer = (
+                    f"{analytics_result.summary}\n\n"
+                    f"**Data:** {json.dumps(analytics_result.data, default=str)}\n\n"
+                    f"Source: deterministic analytics"
+                )
+                return ChatResult(answer=answer, mode="OFFLINE_ARCHIVE", contexts=[])
+
         mode, contexts = await self._gather_contexts(query, prefer_mode, include_web, include_documents, document_ids)
         
         if mode == "OFFLINE_ARCHIVE":
@@ -449,6 +601,19 @@ class ChatService:
     
     async def stream_answer(self, query: str, conversation_id: str, prefer_mode: str | None = None, include_web: bool = True, include_documents: bool = False, document_ids: list[str] | None = None) -> AsyncIterator[StreamEvent]:
         try:
+            if include_documents:
+                analytics_result = await self._try_analytics(query, document_ids)
+                if analytics_result is not None:
+                    answer = (
+                        f"{analytics_result.summary}\n\n"
+                        f"**Data:** {json.dumps(analytics_result.data, default=str)}\n\n"
+                        f"Source: deterministic analytics"
+                    )
+                    yield StreamEvent("meta", {"mode": "OFFLINE_ARCHIVE", "sources": [{"url": "analytics://tabular", "snippet": analytics_result.summary, "retrieval_type": "document_keyword", "source_type": "document"}], "conversation_id": conversation_id})
+                    yield StreamEvent("token", {"text": answer})
+                    yield StreamEvent("done", {"final_text": answer})
+                    return
+
             mode, contexts = await self._gather_contexts(query, prefer_mode, include_web, include_documents, document_ids)
             sources = [context_to_source_dict(c, determine_retrieval_type(mode, self._s.offline_retrieval_mode, c.is_document_source()), self._archive.hash_url) for c in contexts if c.url != FALLBACK_SOURCE_URL]
             yield StreamEvent("meta", {"mode": mode, "sources": sources, "conversation_id": conversation_id})
