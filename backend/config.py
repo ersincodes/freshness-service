@@ -62,6 +62,9 @@ class Settings:
     doc_max_chars: int
     total_context_budget: int
     web_budget_fraction: float
+    # Tabular analytics settings
+    enable_tabular_analytics: bool
+    analytics_groupby_top_n_default: int
 
 
 settings = Settings(
@@ -88,6 +91,8 @@ settings = Settings(
     doc_max_chars=_getenv_int("DOC_MAX_CHARS", 0),
     total_context_budget=_getenv_int("TOTAL_CONTEXT_BUDGET", 14000),
     web_budget_fraction=_getenv_float("WEB_BUDGET_FRACTION", 0.4),
+    enable_tabular_analytics=os.getenv("ENABLE_TABULAR_ANALYTICS", "true").strip().lower() in {"true", "1", "yes"},
+    analytics_groupby_top_n_default=_getenv_int("ANALYTICS_GROUPBY_TOP_N_DEFAULT", 50),
 )
 
 _RUNTIME_OVERRIDES: dict[str, Any] = {}
@@ -138,6 +143,12 @@ def get_settings() -> Settings:
         web_budget_fraction=_RUNTIME_OVERRIDES.get(
             "web_budget_fraction", base.web_budget_fraction
         ),
+        enable_tabular_analytics=_RUNTIME_OVERRIDES.get(
+            "enable_tabular_analytics", base.enable_tabular_analytics
+        ),
+        analytics_groupby_top_n_default=_RUNTIME_OVERRIDES.get(
+            "analytics_groupby_top_n_default", base.analytics_groupby_top_n_default
+        ),
     )
 
 
@@ -154,8 +165,10 @@ def update_settings(overrides: dict[str, Any]) -> Settings:
         "web_max_chars",
         "doc_max_chars",
         "total_context_budget",
+        "analytics_groupby_top_n_default",
     }
     float_keys = {"web_budget_fraction"}
+    bool_keys = {"enable_tabular_analytics"}
     for key, value in overrides.items():
         if value is None:
             continue
@@ -165,6 +178,8 @@ def update_settings(overrides: dict[str, Any]) -> Settings:
             normalized[key] = int(value)
         elif key in float_keys:
             normalized[key] = float(value)
+        elif key in bool_keys:
+            normalized[key] = bool(value)
         else:
             normalized[key] = value
     _RUNTIME_OVERRIDES.update(normalized)

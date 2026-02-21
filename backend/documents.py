@@ -3,10 +3,12 @@ Document extraction and processing module.
 
 Handles PDF and Excel file ingestion with chunking for RAG retrieval.
 Database operations are in repositories/document_repository.py.
+Tabular analytics ingestion writes full sheets into SQLite for deterministic queries.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import sqlite3
@@ -30,6 +32,13 @@ try:
     import xlrd
 except ImportError:
     xlrd = None
+
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentType(str, Enum):
@@ -406,3 +415,189 @@ def process_document(
         return chunk_excel_by_budget(sheets, excel_char_budget)
     else:
         raise ValueError(f"Unsupported document type: {doc_type}")
+
+
+# ============================================================================
+# Tabular Analytics Ingestion (SQLite)
+# ============================================================================
+
+def _infer_column_types(df: Any, original_headers: list[str]) -> dict[str, str]:
+    """Infer semantic types (text, date, numeric) from a pandas DataFrame.
+
+    Used to annotate column metadata so the LLM analytics planner can
+    generate correct predicates (e.g. ``startswith`` for date columns).
+    """
+    import datetime as _dt
+
+    types: dict[str, str] = {"_source_row_number": "integer"}
+    for header in original_headers:
+        col = df[header]
+        non_null = col.dropna()
+        if non_null.empty:
+            types[header] = "text"
+            continue
+
+        sample = non_null.iloc[0]
+
+        if pd is not None and pd.api.types.is_datetime64_any_dtype(col):
+            types[header] = "date"
+        elif isinstance(sample, (_dt.datetime, _dt.date)):
+            types[header] = "date"
+        elif pd is not None and isinstance(sample, pd.Timestamp):
+            types[header] = "date"
+        elif pd is not None and pd.api.types.is_numeric_dtype(col):
+            types[header] = "numeric"
+        else:
+            types[header] = "text"
+    return types
+
+
+def _normalize_cell_value(x: Any) -> str | None:
+    """Convert a cell value to a normalized text string for SQLite storage.
+
+    Date/datetime values with a midnight time component are stored as
+    'YYYY-MM-DD' (no time suffix) so that lexicographic comparisons
+    like ``<= '2020-12-31'`` work correctly.
+    """
+    if x is None:
+        return None
+    import datetime as _dt
+    if isinstance(x, _dt.datetime):
+        if x.hour == 0 and x.minute == 0 and x.second == 0 and x.microsecond == 0:
+            return x.strftime("%Y-%m-%d")
+        return x.isoformat(sep=" ")
+    if isinstance(x, _dt.date):
+        return x.strftime("%Y-%m-%d")
+    if pd is not None and isinstance(x, pd.Timestamp):
+        if x.hour == 0 and x.minute == 0 and x.second == 0 and x.microsecond == 0:
+            return x.strftime("%Y-%m-%d")
+        return x.isoformat(sep=" ")
+    return str(x)
+
+
+def ingest_excel_to_sqlite(
+    *,
+    excel_path: str,
+    document_id: str,
+    sqlite_connection: sqlite3.Connection,
+) -> None:
+    """Ingest all Excel sheets into SQLite tables and register metadata.
+
+    Requires pandas. Silently skips if pandas is unavailable.
+    """
+    if pd is None:
+        logger.warning("pandas is not installed — tabular analytics ingestion skipped")
+        return
+
+    from .repositories.analytics_repository import AnalyticsRepository, ColumnMapping
+
+    analytics_repo = AnalyticsRepository(sqlite_connection)
+
+    sheets: dict[str, Any] = pd.read_excel(excel_path, sheet_name=None)
+    if not sheets:
+        raise ValueError("No sheets found in workbook")
+
+    default_sheet_name = next(iter(sheets.keys()))
+
+    for sheet_name, df in sheets.items():
+        if df is None or df.empty:
+            continue
+
+        original_headers = [str(c) for c in df.columns]
+        augmented_headers = ["_source_row_number", *original_headers]
+
+        df2 = df.copy()
+        df2.insert(0, "_source_row_number", range(1, len(df2) + 1))
+
+        table_name = _build_document_sheet_table_name(document_id=document_id, sheet_name=str(sheet_name))
+        original_to_safe = _build_safe_column_mapping(augmented_headers)
+
+        df2.columns = [original_to_safe[h] for h in augmented_headers]
+        df2 = df2.astype(object).where(pd.notnull(df2), None)
+        for col in df2.columns:
+            df2[col] = df2[col].map(_normalize_cell_value)
+
+        safe_cols = list(df2.columns)
+        _drop_and_create_table(sqlite_connection=sqlite_connection, table_name=table_name, safe_columns=safe_cols)
+        _bulk_insert(sqlite_connection=sqlite_connection, table_name=table_name, safe_columns=safe_cols, rows=df2.itertuples(index=False, name=None))
+
+        inferred_types = _infer_column_types(df, original_headers)
+        columns = [
+            ColumnMapping(
+                original_name=h,
+                safe_name=original_to_safe[h],
+                inferred_type=inferred_types.get(h, "text"),
+            )
+            for h in augmented_headers
+        ]
+
+        analytics_repo.register_document_sheet_table(
+            document_id=document_id,
+            sheet_name=str(sheet_name),
+            table_name=table_name,
+            row_count=len(df2),
+            columns=columns,
+            set_as_default_sheet=(str(sheet_name) == str(default_sheet_name)),
+        )
+
+    logger.info("Ingested %d sheet(s) for document %s into SQLite", len(sheets), document_id)
+
+
+def _build_document_sheet_table_name(*, document_id: str, sheet_name: str) -> str:
+    doc_part = re.sub(r"[^a-zA-Z0-9_]+", "_", document_id)[:24].strip("_") or "doc"
+    sheet_hash = hashlib.sha1(sheet_name.encode("utf-8")).hexdigest()[:10]
+    return f"doc_{doc_part}__{sheet_hash}"
+
+
+def _build_safe_column_mapping(original_headers: list[str]) -> dict[str, str]:
+    used: set[str] = set()
+    mapping: dict[str, str] = {}
+
+    for raw in original_headers:
+        base = re.sub(r"[^a-zA-Z0-9_]+", "_", str(raw).strip().lower())
+        base = re.sub(r"_+", "_", base).strip("_")
+        base = base or "col"
+
+        candidate = f"col_{base}"
+        if candidate[0].isdigit():
+            candidate = f"col_{candidate}"
+
+        unique = candidate
+        suffix = 2
+        while unique in used:
+            unique = f"{candidate}_{suffix}"
+            suffix += 1
+
+        used.add(unique)
+        mapping[str(raw)] = unique
+
+    return mapping
+
+
+def _drop_and_create_table(*, sqlite_connection: sqlite3.Connection, table_name: str, safe_columns: list[str]) -> None:
+    columns_ddl = ", ".join([f"{c} TEXT" for c in safe_columns])
+
+    rownum_col = next((c for c in safe_columns if "source_row_number" in c), None)
+
+    with sqlite_connection:
+        sqlite_connection.execute(f"DROP TABLE IF EXISTS {table_name};")
+        sqlite_connection.execute(f"CREATE TABLE {table_name} ({columns_ddl});")
+        if rownum_col:
+            sqlite_connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table_name}__rownum ON {table_name} ({rownum_col});"
+            )
+
+
+def _bulk_insert(
+    *,
+    sqlite_connection: sqlite3.Connection,
+    table_name: str,
+    safe_columns: list[str],
+    rows: Any,
+) -> None:
+    placeholders = ",".join(["?"] * len(safe_columns))
+    cols_sql = ",".join(safe_columns)
+    sql = f"INSERT INTO {table_name} ({cols_sql}) VALUES ({placeholders});"
+
+    with sqlite_connection:
+        sqlite_connection.executemany(sql, list(rows))

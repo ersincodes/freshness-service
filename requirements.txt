@@ -15,6 +15,7 @@ playwright>=1.41.0
 pypdf>=4.0.0
 openpyxl>=3.1.0
 xlrd>=2.0.0
+pandas>=2.2.0
 
 # Optional: Vector store for semantic search
 chromadb>=0.4.22
