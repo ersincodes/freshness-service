@@ -23,7 +23,8 @@ from pydantic import BaseModel, Field
 
 from .config import get_settings, update_settings
 from .domain import ErrorCode, SourceContext
-from .repositories import ArchiveRepository, DocumentRepository, AnalyticsRepository
+from .analytics.metadata_repository import MetadataRepository
+from .repositories import ArchiveRepository, DocumentRepository
 from .repositories.document_repository import DocumentInfo
 from .documents import DocumentType, DocumentStatus, generate_document_id, get_document_type_from_filename, validate_mime_type, sanitize_filename, process_document, hash_chunk_id, ingest_excel_to_sqlite
 from .integrations import LLMClient, BraveClient
@@ -198,7 +199,7 @@ def _chat_service() -> ChatService:
         BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results),
         _archive_repo(),
         _doc_repo(),
-        analytics_repo=_analytics_repo(),
+        metadata_repo=_metadata_repo(),
     )
 
 
@@ -224,15 +225,23 @@ def _doc_to_response(d: DocumentInfo) -> DocumentResponse:
 # ============================================================================
 
 def _run_analytics_migrations(db_path: str) -> None:
-    """Execute SQL migration files for tabular analytics schema."""
-    migration_file = Path(__file__).parent / "migrations" / "001_tabular_analytics.sql"
-    if not migration_file.exists():
-        logger.warning("Analytics migration file not found: %s", migration_file)
+    """Execute all SQL migration files for tabular analytics schema in order."""
+    migrations_dir = Path(__file__).parent / "migrations"
+    if not migrations_dir.is_dir():
+        logger.warning("Migrations directory not found: %s", migrations_dir)
         return
-    sql = migration_file.read_text(encoding="utf-8")
+    migration_files = sorted(migrations_dir.glob("*.sql"))
     with sqlite3.connect(db_path) as conn:
-        conn.executescript(sql)
-    logger.info("Analytics migrations applied from %s", migration_file.name)
+        for mf in migration_files:
+            try:
+                sql = mf.read_text(encoding="utf-8")
+                conn.executescript(sql)
+                logger.info("Migration applied: %s", mf.name)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" in str(exc).lower():
+                    logger.debug("Migration %s: column already exists, skipping", mf.name)
+                else:
+                    logger.warning("Migration %s failed: %s", mf.name, exc)
 
 
 def _get_analytics_connection(db_path: str) -> sqlite3.Connection:
@@ -245,10 +254,29 @@ def _get_analytics_connection(db_path: str) -> sqlite3.Connection:
 _analytics_conn: sqlite3.Connection | None = None
 
 
-def _analytics_repo() -> AnalyticsRepository | None:
+def _metadata_repo() -> MetadataRepository | None:
     if _analytics_conn is None:
         return None
-    return AnalyticsRepository(_analytics_conn)
+    return MetadataRepository(_analytics_conn)
+
+
+def _cleanup_orphaned_analytics(conn: sqlite3.Connection) -> None:
+    """Remove analytics metadata for documents that no longer exist."""
+    meta_repo = MetadataRepository(conn)
+    cursor = conn.execute(
+        "SELECT DISTINCT dt.document_id FROM document_tables dt "
+        "LEFT JOIN documents d ON dt.document_id = d.document_id "
+        "WHERE d.document_id IS NULL;"
+    )
+    orphaned = [str(r[0]) for r in cursor.fetchall()]
+    for doc_id in orphaned:
+        try:
+            meta_repo.delete_document(doc_id)
+            logger.info("Cleaned up orphaned analytics for document %s", doc_id)
+        except Exception as exc:
+            logger.warning("Orphan cleanup failed for %s: %s", doc_id, exc)
+    if orphaned:
+        logger.info("Cleaned up %d orphaned analytics entries", len(orphaned))
 
 
 def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
@@ -257,8 +285,11 @@ def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
     File naming convention: uploads/{document_id}_{filename}
     """
     conn = _get_analytics_connection(db_path)
-    repo = AnalyticsRepository(conn)
-    already_ingested = set(repo.list_all_document_ids())
+
+    _cleanup_orphaned_analytics(conn)
+
+    meta_repo = MetadataRepository(conn)
+    already_ingested = set(meta_repo.list_all_document_ids())
 
     doc_repo = DocumentRepository(db_path, upload_dir)
     all_docs = doc_repo.list_documents()
@@ -285,12 +316,12 @@ def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
                 sqlite_connection=conn,
             )
             ingested_count += 1
-            logger.warning("Retroactively ingested analytics for document %s (%s)", doc.document_id, doc.filename)
+            logger.info("Retroactively ingested analytics for document %s (%s)", doc.document_id, doc.filename)
         except Exception as exc:
             logger.warning("Retroactive ingestion failed for %s: %s", doc.document_id, exc)
 
     if ingested_count:
-        logger.warning("Retroactive analytics ingestion complete: %d document(s)", ingested_count)
+        logger.info("Retroactive analytics ingestion complete: %d document(s)", ingested_count)
 
     conn.close()
 
@@ -432,6 +463,12 @@ async def delete_document_endpoint(document_id: str) -> dict:
             await asyncio.to_thread(delete_document_chunks_from_vector_store, s.chroma_dir, s.embed_model_name, document_id)
         except Exception:
             pass
+    meta = _metadata_repo()
+    if meta is not None:
+        try:
+            await asyncio.to_thread(meta.delete_document, document_id)
+        except Exception as exc:
+            logger.warning("Analytics cleanup failed for %s: %s", document_id, exc)
     await repo.delete_document_async(document_id)
     await repo.delete_document_file_async(document_id)
     return {"status": "ok", "message": f"Document {document_id} deleted"}
