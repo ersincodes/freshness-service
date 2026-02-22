@@ -9,14 +9,21 @@ from .errors import (
 from .models import (
     AnalyticsPlan,
     AnalyticsResult,
-    CountRowsPlan,
-    CountDistinctPlan,
-    GroupByCountPlan,
-    TableRef,
-    WherePredicate,
+    AnalyticsFilter,
+    ColumnMetadata,
+    ColumnProfile,
+    DatasetProfile,
+    LogicalType,
+    AnalyticsOperation,
+    AggregationOperation,
+    FilterOperator,
+    SQLITE_TYPE_MAP,
 )
 from .router import AnalyticsRouter, AnalyticsRoutingDecision
 from .executor import AnalyticsExecutor
+from .metadata_repository import MetadataRepository
+from .profiler import profile_dataframe
+from .validator import validate_plan, validate_result
 
 __all__ = [
     "AnalyticsError",
@@ -26,12 +33,20 @@ __all__ = [
     "AnalyticsExecutionError",
     "AnalyticsPlan",
     "AnalyticsResult",
-    "CountRowsPlan",
-    "CountDistinctPlan",
-    "GroupByCountPlan",
-    "TableRef",
-    "WherePredicate",
+    "AnalyticsFilter",
+    "ColumnMetadata",
+    "ColumnProfile",
+    "DatasetProfile",
+    "LogicalType",
+    "AnalyticsOperation",
+    "AggregationOperation",
+    "FilterOperator",
+    "SQLITE_TYPE_MAP",
     "AnalyticsRouter",
     "AnalyticsRoutingDecision",
     "AnalyticsExecutor",
+    "MetadataRepository",
+    "profile_dataframe",
+    "validate_plan",
+    "validate_result",
 ]

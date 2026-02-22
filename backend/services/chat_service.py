@@ -13,23 +13,21 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Any
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from ..analytics.errors import AnalyticsError
 from ..analytics.executor import AnalyticsExecutor
+from ..analytics.metadata_repository import MetadataRepository
 from ..analytics.models import AnalyticsPlan, AnalyticsResult
 from ..analytics.router import AnalyticsRouter
 from ..config import Settings
 from ..domain import SourceContext, build_context_string, build_location_string, determine_retrieval_type, context_to_source_dict, DOC_URL_PREFIX, FALLBACK_SOURCE_URL, ErrorCode
 from ..integrations import LLMClient, BraveClient
 from ..repositories import ArchiveRepository, DocumentRepository
-from ..repositories.analytics_repository import AnalyticsRepository
 from ..scraper import get_clean_text
 from ..vector_store import query_similar, upsert_page, query_document_chunks_similar
 
 logger = logging.getLogger(__name__)
-
-_ANALYTICS_PLAN_ADAPTER: TypeAdapter[AnalyticsPlan] = TypeAdapter(AnalyticsPlan)
 
 
 @dataclass(frozen=True)
@@ -164,7 +162,7 @@ class ChatService:
         brave_client: BraveClient,
         archive_repo: ArchiveRepository,
         document_repo: DocumentRepository,
-        analytics_repo: AnalyticsRepository | None = None,
+        metadata_repo: MetadataRepository | None = None,
     ) -> None:
         self._s = settings
         self._llm = llm_client
@@ -172,7 +170,7 @@ class ChatService:
         self._archive = archive_repo
         self._docs = document_repo
         self._analytics_router = AnalyticsRouter()
-        self._analytics_executor = AnalyticsExecutor(analytics_repo) if analytics_repo else None
+        self._analytics_executor = AnalyticsExecutor(metadata_repo) if metadata_repo else None
     
     # ------------------------------------------------------------------
     # Analytics path
@@ -195,7 +193,7 @@ class ChatService:
                 obj = json.loads(raw[start : end + 1])
             else:
                 raise
-        return _ANALYTICS_PLAN_ADAPTER.validate_python(obj)
+        return AnalyticsPlan.model_validate(obj)
 
     def _build_analytics_system_prompt(
         self,
@@ -205,29 +203,44 @@ class ChatService:
     ) -> str:
         if column_types:
             cols_block = "\n".join(
-                f"  - {c} (type: {column_types.get(c, 'text')})" for c in column_names
+                f"  - {c} (type: {column_types.get(c, 'string')})" for c in column_names
             )
         else:
             cols_block = "\n".join(f"  - {c}" for c in column_names)
         return (
             "You are a deterministic analytics planner. "
-            "You translate user questions about a spreadsheet into a JSON plan.\n\n"
-            "RULES:\n"
+            "You translate user questions about a spreadsheet into a single JSON plan.\n\n"
+            "STRICT RULES:\n"
             "1. Output ONLY valid JSON — no markdown fences, no commentary.\n"
-            "2. The JSON must match one of these schemas (discriminated by 'type'):\n"
-            '   a) {"type":"count_rows","table":{"document_id":"..."},"where":[...]}\n'
-            '   b) {"type":"count_distinct","table":{"document_id":"..."},"column":"...","where":[...]}\n'
-            '   c) {"type":"groupby_count","table":{"document_id":"..."},"group_by":"...","where":[...],'
-            '"order":"count_desc","top_n":50}\n'
-            "3. 'where' is a list of predicates: "
-            '{"column":"...","op":"=|!=|<|<=|>|>=|contains|startswith|endswith|is_null|is_not_null","value":"..."}\n'
-            "4. Columns must be ORIGINAL Excel header names from the list below.\n"
-            "5. table.document_id must be: " + json.dumps(document_id) + "\n"
-            "6. Date columns are stored as TEXT in 'YYYY-MM-DD' format. "
-            "To filter by year use the 'startswith' operator (e.g. value='2020'). "
-            "To filter by month use 'startswith' with 'YYYY-MM'. "
-            "NEVER use <= with a date boundary; prefer 'startswith' for partial-date matching "
-            "or use >= with < on the next period start.\n\n"
+            "2. You must NEVER generate SQL.\n"
+            "3. You must NEVER generate date boundary predicates (<=, BETWEEN, startswith on dates).\n"
+            "4. The JSON must have this shape:\n"
+            "   {\n"
+            '     "document_id": "...",\n'
+            '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, groupby_count, select_rows>",\n'
+            '     "target_column": "<column name or null>",\n'
+            '     "group_by": "<column name or null>",\n'
+            '     "select_columns": ["col1", "col2"] or null,\n'
+            '     "filters": [\n'
+            '       {"column": "...", "operator": "...", "value": ...}\n'
+            "     ],\n"
+            '     "order": "count_desc",\n'
+            '     "top_n": 50,\n'
+            '     "limit": 100\n'
+            "   }\n"
+            "5. Allowed filter operators:\n"
+            "   - Numeric: eq, neq, gt, gte, lt, lte\n"
+            "   - String:  eq, neq, contains, startswith\n"
+            '   - Date:    year_equals (value: integer year, e.g. 2020),\n'
+            '              month_equals (value: "YYYY-MM", e.g. "2020-03"),\n'
+            '              between_dates (value: ["YYYY-MM-DD", "YYYY-MM-DD"])\n'
+            "   - Any:     is_null, is_not_null\n"
+            "6. target_column is REQUIRED for count_distinct, sum, avg, min, max.\n"
+            "7. group_by is REQUIRED for groupby_count.\n"
+            "8. select_columns specifies which columns to return for select_rows (null = all columns).\n"
+            "9. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
+            "10. Column names must be ORIGINAL Excel header names from the list below.\n"
+            "11. document_id must be: " + json.dumps(document_id) + "\n\n"
             "AVAILABLE COLUMNS:\n" + cols_block
         )
 
@@ -238,17 +251,17 @@ class ChatService:
         if self._analytics_executor is None:
             return None
 
-        repo = self._analytics_executor._repo
-        sheet_name = repo.resolve_default_sheet_name(document_id)
+        meta = self._analytics_executor.metadata_repo
+        sheet_name = meta.resolve_default_sheet_name(document_id)
         if sheet_name is None:
             return None
 
-        mappings = repo.fetch_column_mappings(document_id, sheet_name)
-        if not mappings:
+        columns = meta.get_columns(document_id, sheet_name)
+        if not columns:
             return None
 
-        column_names = [m.original_name for m in mappings if not m.original_name.startswith("_")]
-        column_types = {m.original_name: m.inferred_type for m in mappings if not m.original_name.startswith("_")}
+        column_names = [c for c in columns if not c.startswith("_")]
+        column_types = {c: m.logical_type for c, m in columns.items() if not c.startswith("_")}
         system_prompt = self._build_analytics_system_prompt(column_names, document_id, column_types)
 
         try:
@@ -262,7 +275,7 @@ class ChatService:
     async def _try_analytics(
         self, query: str, doc_ids: list[str] | None
     ) -> AnalyticsResult | None:
-        """Attempt the full analytics path: route → plan → compile → execute."""
+        """Attempt the full analytics path: route → plan → validate → compile → execute → validate."""
         if not self._can_use_analytics():
             return None
 
@@ -272,7 +285,7 @@ class ChatService:
 
         effective_ids = doc_ids
         if not effective_ids and self._analytics_executor is not None:
-            effective_ids = self._analytics_executor._repo.list_all_document_ids()
+            effective_ids = self._analytics_executor.metadata_repo.list_all_document_ids()
         if not effective_ids:
             return None
 
