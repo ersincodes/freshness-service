@@ -236,6 +236,36 @@ def compile_plan(
         )
         return CompiledSql(sql=sql, parameters=params)
 
+    if plan.operation == "groupby_sum":
+        _require_target(plan)
+        if not plan.group_by:
+            raise AnalyticsCompilationError("groupby_sum requires group_by")
+
+        safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+        safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+
+        order_sql = {
+            "value_desc": "value DESC",
+            "value_asc": "value ASC",
+            # Backward-compatible fallbacks for default/null order values.
+            "count_desc": "value DESC",
+            "count_asc": "value ASC",
+            "key_asc": f"{safe_group_col} ASC",
+            "key_desc": f"{safe_group_col} DESC",
+        }[plan.order]
+
+        top_n = max(1, min(plan.top_n, 1000))
+
+        sql = (
+            f"SELECT {safe_group_col} AS key, SUM({safe_target_col}) AS value "
+            f"FROM {table_name} "
+            f"{where_sql} "
+            f"GROUP BY {safe_group_col} "
+            f"ORDER BY {order_sql} "
+            f"LIMIT {top_n};"
+        )
+        return CompiledSql(sql=sql, parameters=params)
+
     if plan.operation == "select_rows":
         if plan.select_columns:
             for col in plan.select_columns:

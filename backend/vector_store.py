@@ -211,8 +211,37 @@ def query_document_chunks_similar(
         else:
             res = col.query(query_texts=[query], n_results=top_k)
     except Exception:
-        # Fallback without where clause
-        res = col.query(query_texts=[query], n_results=top_k)
+        if where_clause and document_ids:
+            # Never broaden scope when caller requested document filtering.
+            merged_documents: list[str] = []
+            merged_metadatas: list[dict] = []
+            seen_chunk_ids: set[str] = set()
+            for document_id in document_ids:
+                try:
+                    scoped_res: dict[str, Iterable] = col.query(
+                        query_texts=[query],
+                        n_results=top_k,
+                        where={"document_id": document_id},
+                    )
+                except Exception:
+                    continue
+                for doc, meta in zip(
+                    scoped_res.get("documents", [[]])[0],
+                    scoped_res.get("metadatas", [[]])[0],
+                ):
+                    chunk_id = meta.get("chunk_id", "")
+                    if chunk_id and chunk_id not in seen_chunk_ids:
+                        seen_chunk_ids.add(chunk_id)
+                        merged_documents.append(doc)
+                        merged_metadatas.append(meta)
+                    if len(merged_documents) >= top_k:
+                        break
+                if len(merged_documents) >= top_k:
+                    break
+            res = {"documents": [merged_documents], "metadatas": [merged_metadatas]}
+        else:
+            # Unscoped retrieval can safely fall back to global query.
+            res = col.query(query_texts=[query], n_results=top_k)
     
     documents = res.get("documents", [[]])[0]
     metadatas = res.get("metadatas", [[]])[0]

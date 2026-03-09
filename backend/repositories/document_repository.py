@@ -141,41 +141,76 @@ class DocumentRepository:
         "when", "which", "give", "get", "tell", "show", "find", "please",
     })
 
+    @staticmethod
+    def _rows_to_chunks(rows: list[tuple[Any, ...]]) -> list[DocumentChunk]:
+        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+
+    @staticmethod
+    def _tokenize_query(query: str) -> list[str]:
+        tokens = [t for t in query.lower().split() if len(t) > 2 and t not in DocumentRepository._STOP_WORDS]
+        if not tokens:
+            tokens = [query.lower().strip()]
+        return tokens[:10]
+
+    @staticmethod
+    def _scope_clause(document_ids: list[str] | None) -> tuple[str, tuple[str, ...]]:
+        if document_ids:
+            placeholders = ",".join("?" for _ in document_ids)
+            return f"dc.document_id IN ({placeholders})", tuple(document_ids)
+        return "d.status = 'ready'", ()
+
+    def _search_chunks_by_like_clauses(
+        self,
+        *,
+        like_clauses: str,
+        like_params: list[str],
+        document_ids: list[str] | None,
+        limit: int,
+        order: str = "dc.chunk_index ASC",
+        extra_where: str = "",
+        extra_params: tuple[Any, ...] = (),
+    ) -> list[DocumentChunk]:
+        scope_where, scope_params = self._scope_clause(document_ids)
+        where_sql = f"{scope_where} AND ({like_clauses})"
+        if extra_where:
+            where_sql = f"{where_sql} AND {extra_where}"
+
+        with self._conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
+                    FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
+                    WHERE {where_sql}
+                    ORDER BY {order} LIMIT ?""",
+                (*scope_params, *like_params, *extra_params, limit),
+            )
+            rows = cur.fetchall()
+        return self._rows_to_chunks(rows)
+
+    def fetch_chunks(
+        self,
+        query: str,
+        top_k: int = 10,
+        document_ids: list[str] | None = None,
+    ) -> list[DocumentChunk]:
+        """Canonical chunk retrieval API with optional document scoping."""
+        tokens = self._tokenize_query(query)
+        like_clauses = " OR ".join("LOWER(dc.content) LIKE ?" for _ in tokens)
+        like_params = [f"%{t}%" for t in tokens]
+        return self._search_chunks_by_like_clauses(
+            like_clauses=like_clauses,
+            like_params=like_params,
+            document_ids=document_ids,
+            limit=top_k,
+        )
+
     def search_chunks_keyword(self, query: str, document_ids: list[str] | None = None, top_k: int = 5) -> list[DocumentChunk]:
         """Search chunks by keyword tokens with OR logic.
         
         Tokenizes the query and matches individual terms rather than the
         full sentence, which would never appear as a substring in data chunks.
         """
-        tokens = [t for t in query.lower().split() if len(t) > 2 and t not in self._STOP_WORDS]
-        if not tokens:
-            tokens = [query.lower().strip()]
-        tokens = tokens[:10]
-
-        like_clauses = " OR ".join("LOWER(dc.content) LIKE ?" for _ in tokens)
-        like_params = [f"%{t}%" for t in tokens]
-
-        with self._conn() as conn:
-            cur = conn.cursor()
-            if document_ids:
-                placeholders = ",".join("?" for _ in document_ids)
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE dc.document_id IN ({placeholders}) AND ({like_clauses})
-                        ORDER BY dc.chunk_index ASC LIMIT ?""",
-                    (*document_ids, *like_params, top_k),
-                )
-            else:
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                       FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                       WHERE d.status = 'ready' AND ({like_clauses})
-                       ORDER BY dc.chunk_index ASC LIMIT ?""",
-                    (*like_params, top_k),
-                )
-            rows = cur.fetchall()
-        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+        return self.fetch_chunks(query=query, top_k=top_k, document_ids=document_ids)
     
     def search_chunks_by_terms(
         self, terms: list[str], document_ids: list[str] | None = None, limit: int = 10
@@ -186,28 +221,12 @@ class DocumentRepository:
         
         like_clauses = " OR ".join("dc.content LIKE ?" for _ in terms)
         like_params = [f"%{t}%" for t in terms]
-        
-        with self._conn() as conn:
-            cur = conn.cursor()
-            if document_ids:
-                doc_placeholders = ",".join("?" for _ in document_ids)
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE dc.document_id IN ({doc_placeholders}) AND ({like_clauses})
-                        ORDER BY dc.chunk_index ASC LIMIT ?""",
-                    (*document_ids, *like_params, limit),
-                )
-            else:
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE d.status = 'ready' AND ({like_clauses})
-                        ORDER BY dc.chunk_index ASC LIMIT ?""",
-                    (*like_params, limit),
-                )
-            rows = cur.fetchall()
-        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+        return self._search_chunks_by_like_clauses(
+            like_clauses=like_clauses,
+            like_params=like_params,
+            document_ids=document_ids,
+            limit=limit,
+        )
     
     def search_chunks_by_filename(
         self, filename_pattern: str, document_ids: list[str] | None = None, limit: int = 10, last_chunks: bool = False
@@ -215,28 +234,15 @@ class DocumentRepository:
         """Search chunks by filename pattern. Optionally get last chunks (highest chunk_index)."""
         term = f"%{filename_pattern.lower()}%"
         order = "dc.chunk_index DESC" if last_chunks else "dc.chunk_index ASC"
-        
-        with self._conn() as conn:
-            cur = conn.cursor()
-            if document_ids:
-                doc_placeholders = ",".join("?" for _ in document_ids)
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE dc.document_id IN ({doc_placeholders}) AND LOWER(d.filename) LIKE ?
-                        ORDER BY {order} LIMIT ?""",
-                    (*document_ids, term, limit),
-                )
-            else:
-                cur.execute(
-                    f"""SELECT dc.chunk_id, dc.document_id, dc.chunk_index, dc.content, dc.meta_json, dc.timestamp, d.filename
-                        FROM document_chunks dc JOIN documents d ON dc.document_id = d.document_id
-                        WHERE d.status = 'ready' AND LOWER(d.filename) LIKE ?
-                        ORDER BY {order} LIMIT ?""",
-                    (term, limit),
-                )
-            rows = cur.fetchall()
-        return [DocumentChunk(r[0], r[1], r[2], r[3], json.loads(r[4]), r[5], r[6]) for r in rows]
+        return self._search_chunks_by_like_clauses(
+            like_clauses="1 = 1",
+            like_params=[],
+            document_ids=document_ids,
+            limit=limit,
+            order=order,
+            extra_where="LOWER(d.filename) LIKE ?",
+            extra_params=(term,),
+        )
     
     def save_file(self, document_id: str, filename: str, content: bytes) -> str:
         """Save uploaded file to disk."""
@@ -271,6 +277,11 @@ class DocumentRepository:
     
     async def search_chunks_keyword_async(self, query: str, document_ids: list[str] | None = None, top_k: int = 5) -> list[DocumentChunk]:
         return await asyncio.to_thread(self.search_chunks_keyword, query, document_ids, top_k)
+
+    async def fetch_chunks_async(
+        self, query: str, top_k: int = 10, document_ids: list[str] | None = None
+    ) -> list[DocumentChunk]:
+        return await asyncio.to_thread(self.fetch_chunks, query, top_k, document_ids)
     
     async def search_chunks_by_terms_async(
         self, terms: list[str], document_ids: list[str] | None = None, limit: int = 10
