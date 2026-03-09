@@ -16,8 +16,8 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_OPS_REQUIRING_TARGET = {"count_distinct", "sum", "avg", "min", "max"}
-_NUMERIC_AGGREGATES = {"sum", "avg"}
+_OPS_REQUIRING_TARGET = {"count_distinct", "sum", "avg", "min", "max", "groupby_sum"}
+_NUMERIC_AGGREGATES = {"sum", "avg", "groupby_sum"}
 
 
 def validate_plan(
@@ -57,6 +57,14 @@ def validate_plan(
         if group_col not in visible_columns:
             raise AnalyticsPlanValidationError(
                 f"group_by column '{group_col}' not found in columns"
+            )
+
+    if plan.operation == "groupby_sum":
+        if not plan.group_by:
+            raise AnalyticsPlanValidationError("groupby_sum requires group_by")
+        if plan.group_by not in visible_columns:
+            raise AnalyticsPlanValidationError(
+                f"group_by column '{plan.group_by}' not found in columns"
             )
 
     if plan.operation == "select_rows" and plan.select_columns:

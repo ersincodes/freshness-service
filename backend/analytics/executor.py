@@ -96,6 +96,10 @@ class AnalyticsExecutor:
             out_rows = [{"key": r["key"], "count": int(r["cnt"])} for r in rows]
             return {"rows": out_rows}
 
+        if plan.operation == "groupby_sum":
+            out_rows = [{"key": r["key"], "value": r["value"] if r["value"] is not None else 0} for r in rows]
+            return {"rows": out_rows}
+
         if plan.operation == "select_rows":
             out_rows = [dict(r) for r in rows]
             return {"rows": out_rows, "row_count": len(out_rows)}
@@ -119,6 +123,11 @@ class AnalyticsExecutor:
         if op == "groupby_count":
             col = plan.group_by or plan.target_column
             return f"Computed group-by counts for '{col}' (top {plan.top_n})."
+        if op == "groupby_sum":
+            return (
+                f"Computed group-by sums of '{plan.target_column}' by "
+                f"'{plan.group_by}' (top {plan.top_n})."
+            )
         if op == "select_rows":
             return f"Retrieved {data['row_count']} matching row(s)."
         return f"Executed {op}."

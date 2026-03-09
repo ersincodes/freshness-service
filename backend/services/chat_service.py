@@ -217,7 +217,7 @@ class ChatService:
             "4. The JSON must have this shape:\n"
             "   {\n"
             '     "document_id": "...",\n'
-            '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, groupby_count, select_rows>",\n'
+            '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, groupby_count, groupby_sum, select_rows>",\n'
             '     "target_column": "<column name or null>",\n'
             '     "group_by": "<column name or null>",\n'
             '     "select_columns": ["col1", "col2"] or null,\n'
@@ -235,12 +235,14 @@ class ChatService:
             '              month_equals (value: "YYYY-MM", e.g. "2020-03"),\n'
             '              between_dates (value: ["YYYY-MM-DD", "YYYY-MM-DD"])\n'
             "   - Any:     is_null, is_not_null\n"
-            "6. target_column is REQUIRED for count_distinct, sum, avg, min, max.\n"
-            "7. group_by is REQUIRED for groupby_count.\n"
+            "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum.\n"
+            "7. group_by is REQUIRED for groupby_count and groupby_sum.\n"
             "8. select_columns specifies which columns to return for select_rows (null = all columns).\n"
             "9. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
-            "10. Column names must be ORIGINAL Excel header names from the list below.\n"
-            "11. document_id must be: " + json.dumps(document_id) + "\n\n"
+            "10. For intents like 'highest/lowest sum/total <metric> by <category>', use groupby_sum "
+            "with target_column=<metric>, group_by=<category>, top_n=1, and order=value_desc (or value_asc for lowest).\n"
+            "11. Column names must be ORIGINAL Excel header names from the list below.\n"
+            "12. document_id must be: " + json.dumps(document_id) + "\n\n"
             "AVAILABLE COLUMNS:\n" + cols_block
         )
 

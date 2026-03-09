@@ -3,5 +3,9 @@
 __pycache__/
 *.pyc
 knowledge.db
+knowledge.db-*
 chroma_db/
 uploads/
+
+STEP*
+STEP*.md

@@ -229,6 +229,11 @@ class TestSqlCompiler:
                 logical_type="string", sqlite_type="TEXT", nullable=True,
                 original_name="Customer Id", safe_name="col_customer_id",
             ),
+            "Country": ColumnMetadata(
+                column_name="Country",
+                logical_type="string", sqlite_type="TEXT", nullable=True,
+                original_name="Country", safe_name="col_country",
+            ),
         }
 
     def test_count_rows_with_year_filter(self):
@@ -255,6 +260,35 @@ class TestSqlCompiler:
         result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
         assert "COUNT(DISTINCT col_customer_id)" in result.sql
 
+    def test_groupby_count_sql(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_count",
+            group_by="Country",
+            order="count_desc",
+            top_n=1,
+        )
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "COUNT(1) AS cnt" in result.sql
+        assert "GROUP BY col_country" in result.sql
+        assert "ORDER BY cnt DESC" in result.sql
+        assert "LIMIT 1" in result.sql
+
+    def test_groupby_sum_sql(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_sum",
+            target_column="Amount",
+            group_by="Country",
+            order="value_desc",
+            top_n=1,
+        )
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "SUM(col_amount) AS value" in result.sql
+        assert "GROUP BY col_country" in result.sql
+        assert "ORDER BY value DESC" in result.sql
+        assert "LIMIT 1" in result.sql
+
 
 # ============================================================================
 # Validator
@@ -272,6 +306,11 @@ class TestValidator:
                 column_name="Amount",
                 logical_type="float", sqlite_type="REAL", nullable=True,
                 original_name="Amount", safe_name="col_amount",
+            ),
+            "Country": ColumnMetadata(
+                column_name="Country",
+                logical_type="string", sqlite_type="TEXT", nullable=True,
+                original_name="Country", safe_name="col_country",
             ),
         }
 
@@ -302,6 +341,34 @@ class TestValidator:
             filters=[AnalyticsFilter(column="Subscription Date", operator="year_equals", value=2020)],
         )
         validate_plan(plan, self._col_meta())
+
+    def test_reject_groupby_sum_missing_target(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_sum",
+            group_by="Country",
+        )
+        with pytest.raises(AnalyticsPlanValidationError):
+            validate_plan(plan, self._col_meta())
+
+    def test_reject_groupby_sum_missing_group_by(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_sum",
+            target_column="Amount",
+        )
+        with pytest.raises(AnalyticsPlanValidationError):
+            validate_plan(plan, self._col_meta())
+
+    def test_reject_groupby_sum_non_numeric_target(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_sum",
+            target_column="Country",
+            group_by="Country",
+        )
+        with pytest.raises(AnalyticsPlanValidationError):
+            validate_plan(plan, self._col_meta())
 
 
 # ============================================================================
@@ -502,3 +569,32 @@ class TestEndToEnd:
         assert "Index" in row_dict
         assert "Customer Id" in row_dict
         assert "Amount" in row_dict
+
+    def test_groupby_sum_returns_highest_revenue_country_not_highest_count(self, in_memory_db):
+        df = pd.DataFrame(
+            [
+                {"Country": "The Gambia", "Total Revenue": 100.0},
+                {"Country": "The Gambia", "Total Revenue": 100.0},
+                {"Country": "The Gambia", "Total Revenue": 100.0},
+                {"Country": "The Gambia", "Total Revenue": 100.0},
+                {"Country": "USA", "Total Revenue": 1200.0},
+                {"Country": "USA", "Total Revenue": 800.0},
+            ]
+        )
+        doc_id, table_name, col_meta = self._ingest_sample(in_memory_db, df)
+        in_memory_db.row_factory = sqlite3.Row
+
+        plan = AnalyticsPlan(
+            document_id=doc_id,
+            operation="groupby_sum",
+            target_column="Total Revenue",
+            group_by="Country",
+            order="value_desc",
+            top_n=1,
+        )
+        compiled = compile_plan(plan, table_name=table_name, column_metadata=col_meta)
+        rows = in_memory_db.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0]["key"] == "USA"
+        assert rows[0]["value"] == pytest.approx(2000.0)
