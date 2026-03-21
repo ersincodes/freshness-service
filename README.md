@@ -8,9 +8,12 @@ Local-first RAG system with:
 - Brave Search for fresh web retrieval
 - SQLite + optional ChromaDB for offline retrieval
 - Deterministic tabular analytics for Excel documents
+- Time-series forecasting for ingested spreadsheets with structured forecast + chart payloads for the UI
 
 ## Latest Project Changes
 
+- Added predictive forecasting path: baseline linear-trend forecasts with optional `forecast` and Recharts-oriented `chart` on `POST /api/chat` and on SSE `meta`/`done` when ingested data and query intent match.
+- Deterministic analytics answers are formatted as markdown via `backend/analytics/display_markdown.py`.
 - Added deterministic tabular analytics for uploaded Excel files (`.xlsx`, `.xls`).
 - Added analytics metadata migrations in `backend/migrations/`.
 - Added typed analytics schema and dataset profiling support.
@@ -28,6 +31,7 @@ Local-first RAG system with:
 - Lets you upload and chat with PDF/Excel documents.
 - Streams chat responses over SSE.
 - Runs deterministic spreadsheet analytics when document queries are tabular.
+- Runs baseline time-series forecasting on ingested Excel when the query is predictive, returning structured forecast data and a chart spec for the frontend.
 
 ## Requirements
 
@@ -94,7 +98,7 @@ backend/
   integrations/           # LM Studio + Brave clients
   repositories/           # Archive/document/analytics data access
   services/               # Chat + health orchestration
-  analytics/              # Routing, planning, validation, SQL compile, execution
+  analytics/              # Routing, planning, forecasting, chart specs, validation, SQL compile, execution
   migrations/             # SQL migrations for analytics metadata
 
 frontend/
@@ -147,8 +151,25 @@ Tabular analytics:
 Core/chat:
 
 - `GET /` - service info
-- `POST /api/chat` - non-streaming chat response
-- `POST /api/chat/stream` - SSE chat stream (`meta`, `token`, `done`, `error`)
+- `POST /api/chat` - non-streaming chat response; may include optional `forecast` and `chart` when the predictive short-circuit applies
+- `POST /api/chat/stream` - SSE chat stream; event shapes are described under **Chat response and SSE payloads** below
+
+### Chat response and SSE payloads
+
+**REST (`POST /api/chat`)**  
+The JSON body matches the OpenAPI `ChatResponse` model. Fields `forecast` and `chart` are present only when the request hits the predictive forecasting path; they are omitted for normal RAG and for deterministic tabular analytics that do not produce a forecast.
+
+**SSE (`POST /api/chat/stream`)**  
+Event types: `meta`, `token`, `done`, `error`.
+
+- **`meta`** — Always includes `mode`, `sources`, and `conversation_id`. Optionally includes:
+  - `forecast` and `chart` on the predictive path (same shapes as the REST response).
+  - `analytics_unavailable` — `{ "reason", "hint" }` when documents were in scope but tabular analytics could not run (normal RAG continues with this hint on the stream).
+- **`token`** — `{ "text": "..." }` (answer fragments).
+- **`done`** — Always includes `final_text`. On the predictive path, also includes `forecast` and `chart`.
+- **`error`** — `{ "code", "message" }`.
+
+**`sources` entries** may set `source_kind` to `web`, `document`, `analytics`, or `archive` (see the `Source` model in OpenAPI).
 
 Archive:
 
@@ -194,7 +215,8 @@ Legacy compatibility:
 
 Notes:
 
-- If `include_documents=true`, analytics routing can short-circuit normal RAG flow for spreadsheet-style questions.
+- If `include_documents=true` with scoped `document_ids`, **predictive** questions can short-circuit to the forecasting path (returning `forecast` and `chart`) before generic RAG, similar to the tabular analytics short-circuit.
+- If `include_documents=true`, analytics routing can short-circuit normal RAG flow for spreadsheet-style (aggregation/list/filter) questions.
 - If no context is available, mode falls back to `LOCAL_WEIGHTS`.
 
 ## Runtime Data
@@ -231,3 +253,4 @@ pytest -q tests/test_analytics_deterministic.py
 - Empty web extraction: target page may block scraping or require heavy JS.
 - Upload errors: verify file extension and `MAX_UPLOAD_MB`.
 - Analytics not triggering: ensure `ENABLE_TABULAR_ANALYTICS=true` and query has tabular intent (count/list/filter/grouping).
+- Forecast or `chart` missing: requires ingested forecast artifacts on the selected documents, a predictive-style question, `include_documents=true`, and `document_ids` set. For analytics behavior and contracts, see `tests/test_analytics_deterministic.py`.
