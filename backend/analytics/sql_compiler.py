@@ -280,7 +280,14 @@ def compile_plan(
 
         limit = max(1, min(plan.limit, 500))
 
-        sql = f"SELECT {select_clause} FROM {table_name} {where_sql} LIMIT {limit};"
+        rownum = column_metadata.get("_source_row_number")
+        order_sql = (
+            f" ORDER BY {rownum.safe_name} ASC"
+            if rownum is not None
+            else ""
+        )
+
+        sql = f"SELECT {select_clause} FROM {table_name} {where_sql}{order_sql} LIMIT {limit};"
         return CompiledSql(sql=sql, parameters=params)
 
     raise AnalyticsCompilationError(f"Unhandled operation: {plan.operation}")
