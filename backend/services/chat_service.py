@@ -509,6 +509,8 @@ class ChatService:
                 rows = await asyncio.to_thread(query_similar, self._s.chroma_dir, self._s.embed_model_name, query, top_k)
             except Exception:
                 rows = await self._archive.search_offline_async(query, top_k)
+            if not rows:
+                rows = await self._archive.search_offline_async(query, top_k)
         else:
             rows = await self._archive.search_offline_async(query, top_k)
         return [SourceContext(url, text[:self._s.max_chars_per_source], str(ts), False, 0.0) for url, text, ts in rows]
@@ -635,12 +637,15 @@ class ChatService:
         doc_ctx: list[SourceContext] = []
         mode = "LOCAL_WEIGHTS"
         
-        if include_web:
-            if prefer_mode == "OFFLINE":
-                ctx = await self._get_offline_context(query)
-                if ctx:
-                    mode, web_ctx = "OFFLINE_ARCHIVE", ctx
-            elif prefer_mode == "ONLINE":
+        # Live web (Brave) is gated by include_web. The local archive is not live web;
+        # when the user chooses Offline, always query the archive so prior online fetches
+        # remain usable even if the Web checkbox is off.
+        if prefer_mode == "OFFLINE":
+            ctx = await self._get_offline_context(query)
+            if ctx:
+                mode, web_ctx = "OFFLINE_ARCHIVE", ctx
+        elif include_web:
+            if prefer_mode == "ONLINE":
                 ctx = await self._get_online_context(query)
                 if ctx:
                     mode, web_ctx = "ONLINE", ctx
@@ -660,7 +665,12 @@ class ChatService:
                 mode = "OFFLINE_ARCHIVE"
         
         all_ctx = self._allocate_budget(web_ctx, doc_ctx)
-        return (mode, all_ctx) if all_ctx else ("LOCAL_WEIGHTS", [SourceContext.create_fallback()])
+        if not all_ctx:
+            fallback_ctx = [SourceContext.create_fallback()]
+            if prefer_mode == "OFFLINE":
+                return ("OFFLINE_ARCHIVE", fallback_ctx)
+            return ("LOCAL_WEIGHTS", fallback_ctx)
+        return (mode, all_ctx)
     
     def _extraction_prompt(self, contexts: list[SourceContext]) -> str:
         return f"You are a strict information extraction engine.\nUse ONLY the provided context. Return a JSON object with keys:\n- \"answer\": string or null\n- \"citation_url\": string or null\n- \"evidence_quote\": string or null\nIf the answer is not explicitly present, set all to null.\nDo NOT add extra text.\n\nCONTEXT:\n{build_context_string(contexts)}"
@@ -869,14 +879,55 @@ class ChatService:
             }
             if analytics_unavailable is not None:
                 meta_payload["analytics_unavailable"] = analytics_unavailable
+
+            if mode == "OFFLINE_ARCHIVE":
+                cached = await self._archive.get_cached_answer_async(query)
+                if cached:
+                    resp = f"{cached.answer}\n\nSource: {cached.citation_url or 'cached answer'}"
+                    if cached.evidence_quote:
+                        resp += f"\nEvidence: {cached.evidence_quote}"
+                    final_text = f"{stream_prefix}{resp}\n(Cached from: {cached.timestamp})"
+                    yield StreamEvent("meta", meta_payload)
+                    yield StreamEvent("token", {"text": final_text})
+                    yield StreamEvent("done", {"final_text": final_text})
+                    return
+
+            extraction = await self._llm.extract_json(self._extraction_prompt(contexts), query)
+            if extraction and extraction.get("answer"):
+                ans, cite, ev = extraction["answer"], extraction.get("citation_url") or (contexts[0].url if contexts else None), extraction.get("evidence_quote")
+                resp = f"{ans}\n\nSource: {cite or 'extracted from context'}"
+                if ev:
+                    resp += f"\nEvidence: {ev}"
+                if mode == "ONLINE":
+                    await self._archive.save_answer_async(query, ans, cite, ev)
+                final_text = f"{stream_prefix}{resp}" if stream_prefix else resp
+                yield StreamEvent("meta", meta_payload)
+                yield StreamEvent("token", {"text": final_text})
+                yield StreamEvent("done", {"final_text": final_text})
+                return
+
+            if mode in {"OFFLINE_ARCHIVE", "LOCAL_WEIGHTS"}:
+                msg = (
+                    "I could not verify the answer from the offline archive. Please try online mode or add a relevant source."
+                    if mode == "OFFLINE_ARCHIVE"
+                    else "I do not have any sources to answer this question. Please try online mode or add sources to the archive."
+                )
+                final_text = f"{stream_prefix}{msg}" if stream_prefix else msg
+                yield StreamEvent("meta", meta_payload)
+                yield StreamEvent("token", {"text": final_text})
+                yield StreamEvent("done", {"final_text": final_text})
+                return
+
             yield StreamEvent("meta", meta_payload)
-            
+
             full_resp = ""
+            model_resp = ""
             prefix_sent = False
             try:
                 async for chunk in self._llm.stream(self._answer_prompt(mode, contexts, include_documents), query):
                     if chunk.content:
                         text = chunk.content
+                        model_resp += text
                         if stream_prefix and not prefix_sent:
                             text = stream_prefix + text
                             prefix_sent = True
@@ -887,6 +938,7 @@ class ChatService:
             except Exception:
                 resp = await self._llm.complete(self._answer_prompt(mode, contexts, include_documents), query)
                 body = resp.content or ""
+                model_resp = body
                 if stream_prefix and not prefix_sent:
                     body = stream_prefix + body
                     prefix_sent = True
@@ -895,6 +947,10 @@ class ChatService:
             if stream_prefix and not prefix_sent:
                 full_resp = stream_prefix + full_resp
                 yield StreamEvent("token", {"text": stream_prefix})
+            if mode == "ONLINE" and model_resp.strip():
+                await self._archive.save_answer_async(
+                    query, model_resp.strip(), contexts[0].url if contexts else None, None
+                )
             yield StreamEvent("done", {"final_text": full_resp})
         except Exception as e:
             yield StreamEvent("error", {"code": ErrorCode.STREAM_ERROR, "message": str(e)})

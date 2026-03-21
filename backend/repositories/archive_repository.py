@@ -103,13 +103,13 @@ class ArchiveRepository:
         with self._conn() as conn:
             cur = conn.cursor()
             cur.execute("INSERT OR IGNORE INTO pages VALUES (?, ?, ?, ?)", (url_hash, url, content, now))
-            cur.execute("INSERT INTO search_history VALUES (?, ?, ?)", (query.lower(), url_hash, now))
+            cur.execute("INSERT INTO search_history VALUES (?, ?, ?)", (query.lower().strip(), url_hash, now))
             conn.commit()
         return url_hash
     
     def search_offline(self, query: str, top_k: int = 3) -> list[tuple[str, str, str]]:
         """Keyword search in archive."""
-        term = f"%{query.lower()}%"
+        term = f"%{query.lower().strip()}%"
         with self._conn() as conn:
             cur = conn.cursor()
             cur.execute(
