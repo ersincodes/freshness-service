@@ -33,6 +33,10 @@ from backend.analytics.sql_compiler import (
 from backend.analytics.validator import validate_plan, validate_result
 from backend.analytics.errors import AnalyticsPlanValidationError
 from backend.documents import _infer_logical_type, _normalize_cell_value
+from backend.services.chat_service import (
+    apply_select_rows_limit_from_user_query,
+    infer_select_rows_limit_from_query,
+)
 
 
 # ============================================================================
@@ -288,6 +292,64 @@ class TestSqlCompiler:
         assert "GROUP BY col_country" in result.sql
         assert "ORDER BY value DESC" in result.sql
         assert "LIMIT 1" in result.sql
+
+    def test_select_rows_orders_by_source_row_number_when_present(self):
+        meta = {
+            **self._col_meta(),
+            "_source_row_number": ColumnMetadata(
+                column_name="_source_row_number",
+                logical_type="integer",
+                sqlite_type="INTEGER",
+                nullable=False,
+                original_name="_source_row_number",
+                safe_name="col__source_row_number",
+            ),
+        }
+        plan = AnalyticsPlan(document_id="doc1", operation="select_rows", limit=3)
+        result = compile_plan(plan, table_name="t1", column_metadata=meta)
+        assert "ORDER BY col__source_row_number ASC" in result.sql
+        assert "LIMIT 3" in result.sql
+
+    def test_select_rows_no_order_without_source_row_column(self):
+        plan = AnalyticsPlan(document_id="doc1", operation="select_rows", limit=5)
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "ORDER BY" not in result.sql
+        assert "LIMIT 5" in result.sql
+
+
+# ============================================================================
+# select_rows limit inference (user query)
+# ============================================================================
+
+
+class TestSelectRowsLimitFromQuery:
+    def test_first_ten_over_filename_hundred(self):
+        q = "List first 10 rows of 100 Sales Record file ?"
+        assert infer_select_rows_limit_from_query(q) == 10
+
+    def test_top_five(self):
+        assert infer_select_rows_limit_from_query("show top 5 customers") == 5
+
+    def test_num_rows_phrase(self):
+        assert infer_select_rows_limit_from_query("list 20 rows") == 20
+
+    def test_limit_keyword(self):
+        assert infer_select_rows_limit_from_query("select all limit 7") == 7
+
+    def test_no_match_for_filename_only(self):
+        assert infer_select_rows_limit_from_query("open 100 Sales Record file") is None
+
+    def test_apply_override_only_for_select_rows(self):
+        plan = AnalyticsPlan(document_id="d", operation="count_rows")
+        assert apply_select_rows_limit_from_user_query(plan, "first 3 rows") is plan
+
+    def test_apply_override_sets_limit(self):
+        plan = AnalyticsPlan(document_id="d", operation="select_rows", limit=100)
+        out = apply_select_rows_limit_from_user_query(
+            plan, "List first 10 rows of 100 Sales Record file"
+        )
+        assert out.limit == 10
+        assert plan.limit == 100
 
 
 # ============================================================================
@@ -598,3 +660,108 @@ class TestEndToEnd:
         assert len(rows) == 1
         assert rows[0]["key"] == "USA"
         assert rows[0]["value"] == pytest.approx(2000.0)
+
+
+# ============================================================================
+# Markdown display for chat (deterministic analytics)
+# ============================================================================
+
+
+def test_format_select_rows_markdown_dates_and_integers():
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    meta = {
+        "Order Date": ColumnMetadata(
+            column_name="Order Date",
+            logical_type="date",
+            sqlite_type="INTEGER",
+            nullable=False,
+            original_name="Order Date",
+            safe_name="order_date",
+        ),
+        "Units Sold": ColumnMetadata(
+            column_name="Units Sold",
+            logical_type="integer",
+            sqlite_type="INTEGER",
+            nullable=False,
+            original_name="Units Sold",
+            safe_name="units_sold",
+        ),
+    }
+    ar = AnalyticsResult(
+        summary="Retrieved 1 matching row(s).",
+        sql="SELECT 1",
+        parameters=[],
+        data={
+            "rows": [{"Order Date": 1275004800, "Units Sold": 9925}],
+            "row_count": 1,
+        },
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, meta)
+    assert "2010-05-28" in md
+    assert "9,925" in md
+    assert "| Order Date |" in md
+    assert "| Units Sold |" in md
+
+
+def test_format_scalar_analytics_summary_only():
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    ar = AnalyticsResult(
+        summary="Counted 100 rows.",
+        sql="SELECT COUNT",
+        parameters=[],
+        data={"count": 100},
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, {})
+    assert md == "Counted 100 rows."
+
+
+def test_format_groupby_count_table():
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    ar = AnalyticsResult(
+        summary="Computed group-by counts for 'Region' (top 50).",
+        sql="SELECT 1",
+        parameters=[],
+        data={"rows": [{"key": "A", "count": 3}, {"key": "B", "count": 1}]},
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, {})
+    assert "| key | count |" in md
+    assert "| A | 3 |" in md
+
+
+def test_format_select_rows_coerces_sqlite_row_objects():
+    """sqlite3.Row is not isinstance(..., dict); formatter must still emit a table."""
+    import sqlite3
+
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (Region TEXT, Units INTEGER)")
+    conn.execute("INSERT INTO t VALUES ('Australia', 9925)")
+    row = conn.execute("SELECT * FROM t").fetchone()
+    ar = AnalyticsResult(
+        summary="Retrieved 1 matching row(s).",
+        sql="SELECT 1",
+        parameters=[],
+        data={"rows": [row], "row_count": 1},
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, {})
+    assert "| Region |" in md
+    assert "| Australia |" in md
+    assert "9,925" in md
+    assert "**Data:**" not in md

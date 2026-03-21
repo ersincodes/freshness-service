@@ -77,7 +77,7 @@ class AnalyticsPlan(BaseModel):
     order: Literal["count_desc", "count_asc", "value_desc", "value_asc", "key_asc", "key_desc"] = "count_desc"
     top_n: int = 50
     select_columns: list[str] | None = None
-    limit: int = 100
+    limit: int = 50
 
     @model_validator(mode="before")
     @classmethod
@@ -89,7 +89,7 @@ class AnalyticsPlan(BaseModel):
             if values.get("top_n") is None:
                 values["top_n"] = 50
             if values.get("limit") is None:
-                values["limit"] = 100
+                values["limit"] = 50
             if values.get("filters") is None:
                 values["filters"] = []
         return values

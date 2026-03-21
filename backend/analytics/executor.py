@@ -1,6 +1,7 @@
 """Execute compiled analytics SQL against SQLite and format results."""
 from __future__ import annotations
 
+import json
 import logging
 
 from .errors import (
@@ -110,6 +111,8 @@ class AnalyticsExecutor:
 
         if plan.operation == "select_rows":
             out_rows = [dict(r) for r in rows]
+            # JSON round-trip ensures plain dict/list scalars (avoids sqlite3.Row or odd types in chat formatting).
+            out_rows = [json.loads(json.dumps(row, default=str)) for row in out_rows]
             return {"rows": out_rows, "row_count": len(out_rows)}
 
         raise AnalyticsPlanValidationError(f"Unhandled operation: {plan.operation}")

@@ -1,4 +1,5 @@
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { User, Bot, Loader2 } from "lucide-react";
 import type { ChartSpec, ChatTurn, Source } from "../../lib/types";
 import { ModeBadge } from "./mode-badge";
@@ -69,7 +70,29 @@ export function Message({ turn, onSourceClick, selectedSourceUrl }: MessageProps
         <div className="prose prose-sm max-w-none text-gray-700">
           {turn.content ? (
             <ReactMarkdown
+              remarkPlugins={[remarkGfm]}
               components={{
+                table: ({ children }) => (
+                  <div className="my-3 overflow-x-auto rounded-lg border border-gray-200">
+                    <table className="min-w-full w-max border-collapse text-left text-xs tabular-nums text-gray-800">
+                      {children}
+                    </table>
+                  </div>
+                ),
+                thead: ({ children }) => (
+                  <thead className="border-b border-gray-200 bg-gray-100">{children}</thead>
+                ),
+                th: ({ children }) => (
+                  <th className="whitespace-nowrap px-3 py-2 font-semibold text-gray-900">
+                    {children}
+                  </th>
+                ),
+                td: ({ children }) => (
+                  <td className="border-t border-gray-100 px-3 py-2 align-top">{children}</td>
+                ),
+                tbody: ({ children }) => (
+                  <tbody className="[&>tr:nth-child(even)]:bg-gray-50/70">{children}</tbody>
+                ),
                 // Style code blocks
                 code: ({ className, children, ...props }) => {
                   const isInline = !className;
