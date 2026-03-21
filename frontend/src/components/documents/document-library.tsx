@@ -7,6 +7,8 @@ import { useState, useRef, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../ui/button";
 import { Card } from "../ui/card";
+import { useChat } from "../../store/chat-store.tsx";
+import { cn } from "../../lib/utils";
 import {
   listDocuments,
   uploadDocument,
@@ -70,12 +72,37 @@ interface DocumentItemProps {
   document: Document;
   onDelete: (id: string) => void;
   isDeleting: boolean;
+  selected: boolean;
+  onToggleSelect: (id: string) => void;
 }
 
-function DocumentItem({ document, onDelete, isDeleting }: DocumentItemProps) {
+function DocumentItem({
+  document,
+  onDelete,
+  isDeleting,
+  selected,
+  onToggleSelect,
+}: DocumentItemProps) {
+  const canSelect = document.status === "ready";
   return (
-    <div className="flex items-center justify-between p-4 border-b border-gray-100 last:border-b-0 hover:bg-gray-50">
+    <div
+      className={cn(
+        "flex items-center justify-between p-4 border-b border-gray-100 last:border-b-0 transition-colors",
+        selected ? "bg-primary-50/90 ring-1 ring-inset ring-primary-200" : "hover:bg-gray-50"
+      )}
+    >
       <div className="flex items-center gap-3 flex-1 min-w-0">
+        {canSelect ? (
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={() => onToggleSelect(document.document_id)}
+            className="h-4 w-4 rounded border-gray-300 text-primary-600 focus:ring-primary-500 shrink-0"
+            aria-label={`Use ${document.filename} in chat scope`}
+          />
+        ) : (
+          <span className="w-4 shrink-0" aria-hidden />
+        )}
         <span className="text-2xl">{getDocTypeIcon(document.doc_type)}</span>
         <div className="flex-1 min-w-0">
           <p className="font-medium text-gray-900 truncate" title={document.filename}>
@@ -211,6 +238,8 @@ function UploadZone({ onUpload, isUploading }: UploadZoneProps) {
 export function DocumentLibrary() {
   const queryClient = useQueryClient();
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const { state, toggleSelectedDocument, removeDocumentFromSelection } = useChat();
+  const selectedSet = new Set(state.selectedDocumentIds);
   
   // Fetch documents list
   const {
@@ -241,9 +270,10 @@ export function DocumentLibrary() {
   // Delete mutation
   const deleteMutation = useMutation({
     mutationFn: deleteDocument,
-    onSuccess: () => {
+    onSuccess: (_, documentId) => {
       queryClient.invalidateQueries({ queryKey: ["documents"] });
       setDeletingId(null);
+      removeDocumentFromSelection(documentId);
     },
     onError: () => {
       setDeletingId(null);
@@ -281,7 +311,8 @@ export function DocumentLibrary() {
         <h1 className="text-2xl font-bold text-gray-900 mb-2">Document Library</h1>
         <p className="text-gray-600">
           Upload PDF and Excel files to chat with your data. Documents are processed
-          and indexed for retrieval.
+          and indexed for retrieval. Select ready documents to scope chat and analytics
+          to specific files (leave none selected for global document search).
         </p>
       </div>
       
@@ -332,6 +363,8 @@ export function DocumentLibrary() {
                 document={doc}
                 onDelete={handleDelete}
                 isDeleting={deletingId === doc.document_id}
+                selected={selectedSet.has(doc.document_id)}
+                onToggleSelect={toggleSelectedDocument}
               />
             ))}
           </div>

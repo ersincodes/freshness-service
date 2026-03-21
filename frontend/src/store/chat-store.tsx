@@ -24,6 +24,7 @@ import type {
   Source,
   RetrievalMode,
   PreferredChatMode,
+  ChartSpec,
 } from "../lib/types";
 import { generateId, storage } from "../lib/utils";
 import { sendChatMessage } from "../lib/api";
@@ -59,7 +60,9 @@ type ChatAction =
   | { type: "CLEAR_CONVERSATION"; payload: string }
   | { type: "SET_INCLUDE_WEB"; payload: boolean }
   | { type: "SET_INCLUDE_DOCUMENTS"; payload: boolean }
-  | { type: "SET_SELECTED_DOCUMENT_IDS"; payload: string[] };
+  | { type: "SET_SELECTED_DOCUMENT_IDS"; payload: string[] }
+  | { type: "REMOVE_SELECTED_DOCUMENT"; payload: string }
+  | { type: "TOGGLE_SELECTED_DOCUMENT"; payload: string };
 
 // ============================================================================
 // Storage Keys
@@ -179,6 +182,23 @@ function chatReducer(state: ChatState, action: ChatAction): ChatState {
     case "SET_SELECTED_DOCUMENT_IDS":
       return { ...state, selectedDocumentIds: action.payload };
 
+    case "REMOVE_SELECTED_DOCUMENT":
+      return {
+        ...state,
+        selectedDocumentIds: state.selectedDocumentIds.filter(
+          (id) => id !== action.payload
+        ),
+      };
+
+    case "TOGGLE_SELECTED_DOCUMENT": {
+      const id = action.payload;
+      const cur = state.selectedDocumentIds;
+      if (cur.includes(id)) {
+        return { ...state, selectedDocumentIds: cur.filter((x) => x !== id) };
+      }
+      return { ...state, selectedDocumentIds: [...cur, id] };
+    }
+
     default:
       return state;
   }
@@ -202,6 +222,8 @@ interface ChatContextValue {
   setIncludeWeb: (include: boolean) => void;
   setIncludeDocuments: (include: boolean) => void;
   setSelectedDocumentIds: (ids: string[]) => void;
+  removeDocumentFromSelection: (documentId: string) => void;
+  toggleSelectedDocument: (documentId: string) => void;
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null);
@@ -289,6 +311,14 @@ export function ChatProvider({ children }: ChatProviderProps) {
     dispatch({ type: "SET_SELECTED_DOCUMENT_IDS", payload: ids });
   }, []);
 
+  const removeDocumentFromSelection = useCallback((documentId: string) => {
+    dispatch({ type: "REMOVE_SELECTED_DOCUMENT", payload: documentId });
+  }, []);
+
+  const toggleSelectedDocument = useCallback((documentId: string) => {
+    dispatch({ type: "TOGGLE_SELECTED_DOCUMENT", payload: documentId });
+  }, []);
+
   // Send message
   const sendMessage = useCallback(
     async (content: string, useStreaming: boolean = true) => {
@@ -325,6 +355,9 @@ export function ChatProvider({ children }: ChatProviderProps) {
         content: "",
         created_at: new Date().toISOString(),
         isStreaming: useStreaming,
+        requestIncludeDocuments:
+          stateRef.current.selectedDocumentIds.length > 0 ||
+          stateRef.current.includeDocuments,
       };
       dispatch({ type: "ADD_TURN", payload: { conversationId, turn: assistantTurn } });
 
@@ -345,22 +378,30 @@ export function ChatProvider({ children }: ChatProviderProps) {
               conversation_id: targetConversationId,
               prefer_mode: stateRef.current.preferredMode,
               include_web: stateRef.current.includeWeb,
-              include_documents: stateRef.current.includeDocuments,
-              document_ids: stateRef.current.selectedDocumentIds.length > 0
-                ? stateRef.current.selectedDocumentIds
-                : undefined,
+              include_documents:
+                stateRef.current.selectedDocumentIds.length > 0
+                  ? true
+                  : stateRef.current.includeDocuments,
+              document_ids:
+                stateRef.current.selectedDocumentIds.length > 0
+                  ? stateRef.current.selectedDocumentIds
+                  : undefined,
             },
             {
               onMeta: (data) => {
+                const updates: Partial<ChatTurn> = {
+                  mode: data.mode as RetrievalMode,
+                  sources: data.sources as Source[],
+                };
+                if (data.chart) {
+                  updates.chart = data.chart as ChartSpec;
+                }
                 dispatch({
                   type: "UPDATE_TURN",
                   payload: {
                     conversationId: targetConversationId,
                     turnId: targetTurnId,
-                    updates: {
-                      mode: data.mode as RetrievalMode,
-                      sources: data.sources as Source[],
-                    },
+                    updates,
                   },
                 });
               },
@@ -374,13 +415,17 @@ export function ChatProvider({ children }: ChatProviderProps) {
                   },
                 });
               },
-              onDone: () => {
+              onDone: (doneData) => {
+                const updates: Partial<ChatTurn> = { isStreaming: false };
+                if (doneData.chart) {
+                  updates.chart = doneData.chart as ChartSpec;
+                }
                 dispatch({
                   type: "UPDATE_TURN",
                   payload: {
                     conversationId: targetConversationId,
                     turnId: targetTurnId,
-                    updates: { isStreaming: false },
+                    updates,
                   },
                 });
                 dispatch({ type: "SET_LOADING", payload: false });
@@ -410,10 +455,14 @@ export function ChatProvider({ children }: ChatProviderProps) {
             conversation_id: targetConversationId,
             prefer_mode: stateRef.current.preferredMode,
             include_web: stateRef.current.includeWeb,
-            include_documents: stateRef.current.includeDocuments,
-            document_ids: stateRef.current.selectedDocumentIds.length > 0
-              ? stateRef.current.selectedDocumentIds
-              : undefined,
+            include_documents:
+              stateRef.current.selectedDocumentIds.length > 0
+                ? true
+                : stateRef.current.includeDocuments,
+            document_ids:
+              stateRef.current.selectedDocumentIds.length > 0
+                ? stateRef.current.selectedDocumentIds
+                : undefined,
           });
 
           dispatch({
@@ -426,6 +475,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
                 mode: response.mode,
                 sources: response.sources,
                 isStreaming: false,
+                chart: response.chart,
               },
             },
           });
@@ -471,6 +521,8 @@ export function ChatProvider({ children }: ChatProviderProps) {
     setIncludeWeb,
     setIncludeDocuments,
     setSelectedDocumentIds,
+    removeDocumentFromSelection,
+    toggleSelectedDocument,
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;

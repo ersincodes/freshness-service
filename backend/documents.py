@@ -637,10 +637,34 @@ def ingest_excel_to_sqlite(
         if str(sheet_name) == str(default_sheet_name):
             meta_repo.register_default_sheet(document_id, str(sheet_name))
 
-        # Compute and persist profile
+        # Compute and persist profile, time-series metadata, and baseline forecasts
         try:
             profile = profile_dataframe(df2, col_meta_dict)
             meta_repo.upsert_profile(document_id, str(sheet_name), profile)
+            from .analytics.forecast_repository import ForecastRepository
+            from .analytics.forecaster import generate_sheet_forecasts
+            from .analytics.profiler import build_timeseries_record, measures_json_dumps
+
+            tcol, mrows, elig, ts_reason = build_timeseries_record(df2, col_meta_dict)
+            meta_repo.upsert_timeseries_meta(
+                document_id,
+                str(sheet_name),
+                tcol,
+                measures_json_dumps(mrows),
+                elig,
+                ts_reason,
+            )
+            if elig and tcol is not None and mrows:
+                fc_repo = ForecastRepository(sqlite_connection)
+                generate_sheet_forecasts(
+                    df2,
+                    col_meta_dict,
+                    document_id,
+                    str(sheet_name),
+                    tcol,
+                    mrows,
+                    fc_repo,
+                )
         except Exception as exc:
             logger.warning("Profiling failed for sheet '%s': %s", sheet_name, exc)
 

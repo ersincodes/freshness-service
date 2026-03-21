@@ -1,8 +1,9 @@
 import ReactMarkdown from "react-markdown";
 import { User, Bot, Loader2 } from "lucide-react";
-import type { ChatTurn, Source } from "../../lib/types";
+import type { ChartSpec, ChatTurn, Source } from "../../lib/types";
 import { ModeBadge } from "./mode-badge";
 import { SourceChip } from "./source-chip";
+import { ChartView } from "./chart-view";
 import { cn, formatDate } from "../../lib/utils";
 
 interface MessageProps {
@@ -11,9 +12,23 @@ interface MessageProps {
   selectedSourceUrl?: string;
 }
 
+function hasDocumentLikeSource(sources: Source[] | undefined): boolean {
+  return (
+    sources?.some(
+      (s) => s.source_kind === "document" || s.source_kind === "analytics"
+    ) ?? false
+  );
+}
+
 export function Message({ turn, onSourceClick, selectedSourceUrl }: MessageProps) {
   const isUser = turn.role === "user";
   const isAssistant = turn.role === "assistant";
+  const showDocAttribution =
+    isAssistant &&
+    turn.requestIncludeDocuments &&
+    !turn.isStreaming &&
+    !turn.error;
+  const docLike = hasDocumentLikeSource(turn.sources);
   
   return (
     <div
@@ -113,7 +128,7 @@ export function Message({ turn, onSourceClick, selectedSourceUrl }: MessageProps
             <div className="flex flex-wrap gap-2">
               {turn.sources.map((source, index) => (
                 <SourceChip
-                  key={`${source.url}-${index}`}
+                  key={`${source.document_id ?? source.url}-${index}`}
                   source={source}
                   onClick={() => onSourceClick?.(source)}
                   isSelected={selectedSourceUrl === source.url}
@@ -122,7 +137,21 @@ export function Message({ turn, onSourceClick, selectedSourceUrl }: MessageProps
             </div>
           </div>
         )}
+        {showDocAttribution && !docLike && (
+          <div className="mt-3 pt-3 border-t border-gray-100">
+            <span className="text-xs text-gray-400 italic">
+              No documents used in this answer
+            </span>
+          </div>
+        )}
+        {isAssistant && turn.chart && isLineChart(turn.chart) && (
+          <ChartView chart={turn.chart} />
+        )}
       </div>
     </div>
   );
+}
+
+function isLineChart(c: ChartSpec): boolean {
+  return c.type === "line_chart";
 }

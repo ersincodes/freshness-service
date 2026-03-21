@@ -10,15 +10,25 @@ import logging
 import re
 import sqlite3
 import time
+import dataclasses
 from dataclasses import dataclass
 from typing import AsyncIterator, Any
 
 from pydantic import ValidationError
 
+from ..analytics.chart_builder import build_forecast_line_chart
 from ..analytics.errors import AnalyticsError
 from ..analytics.executor import AnalyticsExecutor
 from ..analytics.metadata_repository import MetadataRepository
-from ..analytics.models import AnalyticsPlan, AnalyticsResult
+from ..analytics.models import (
+    AnalyticsPlan,
+    AnalyticsResult,
+    AnalyticsUnavailable,
+    ForecastChatPayload,
+    ForecastUnavailable,
+)
+from ..analytics.planner import effective_analytics_document_ids
+from ..analytics.predictive import is_predictive_intent, resolve_forecast_for_chat
 from ..analytics.router import AnalyticsRouter
 from ..config import Settings
 from ..domain import SourceContext, build_context_string, build_location_string, determine_retrieval_type, context_to_source_dict, DOC_URL_PREFIX, FALLBACK_SOURCE_URL, ErrorCode
@@ -35,6 +45,9 @@ class ChatResult:
     answer: str
     mode: str
     contexts: list[SourceContext]
+    attached_sources: list[dict[str, Any]] | None = None
+    forecast: dict[str, Any] | None = None
+    chart: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +195,35 @@ class ChatService:
             and self._analytics_executor is not None
         )
 
+    def _analytics_source_payload(self, ar: AnalyticsResult) -> dict[str, Any]:
+        filename: str | None = None
+        if ar.document_id:
+            info = self._docs.get_document(ar.document_id)
+            if info:
+                filename = info.filename
+        return {
+            "url": "analytics://tabular",
+            "snippet": (ar.summary[:500] if ar.summary else ""),
+            "retrieval_type": "document_keyword",
+            "source_type": "document",
+            "source_kind": "analytics",
+            "document_id": ar.document_id,
+            "sheet_name": ar.sheet_name,
+            "display_name": filename or ar.document_id or "Analytics",
+        }
+
+    def _forecast_source_payload(self, fc: ForecastChatPayload) -> dict[str, Any]:
+        return {
+            "url": "forecast://artifact",
+            "snippet": f"{fc.measure} forecast ({fc.model})",
+            "retrieval_type": "document_keyword",
+            "source_type": "document",
+            "source_kind": "analytics",
+            "document_id": fc.document_id,
+            "sheet_name": fc.sheet,
+            "display_name": fc.document or fc.document_id,
+        }
+
     def _parse_analytics_plan_json(self, plan_json_text: str) -> AnalyticsPlan:
         """Validate raw JSON text from the LLM into a typed AnalyticsPlan."""
         raw = plan_json_text.strip()
@@ -276,7 +318,7 @@ class ChatService:
 
     async def _try_analytics(
         self, query: str, doc_ids: list[str] | None
-    ) -> AnalyticsResult | None:
+    ) -> AnalyticsResult | AnalyticsUnavailable | None:
         """Attempt the full analytics path: route → plan → validate → compile → execute → validate."""
         if not self._can_use_analytics():
             return None
@@ -285,11 +327,14 @@ class ChatService:
         if not decision.use_analytics:
             return None
 
-        effective_ids = doc_ids
-        if not effective_ids and self._analytics_executor is not None:
-            effective_ids = self._analytics_executor.metadata_repo.list_all_document_ids()
-        if not effective_ids:
+        assert self._analytics_executor is not None
+        meta = self._analytics_executor.metadata_repo
+        resolved = effective_analytics_document_ids(meta, doc_ids)
+        if isinstance(resolved, AnalyticsUnavailable):
+            return resolved
+        if resolved is None:
             return None
+        effective_ids = resolved
 
         for doc_id in effective_ids:
             try:
@@ -575,17 +620,69 @@ class ChatService:
         return f"You are a helpful AI that answers ONLY from provided context.\nCurrent Mode: {mode}\nInstructions: Use the provided context to answer. If the context is empty or does not contain the exact answer, say you could not verify it.\nAlways cite the source for factual claims.\n{sec}\nCONTEXT:\n{build_context_string(contexts)}"
     
     async def get_answer(self, query: str, prefer_mode: str | None = None, include_web: bool = True, include_documents: bool = False, document_ids: list[str] | None = None) -> ChatResult:
-        if include_documents:
-            analytics_result = await self._try_analytics(query, document_ids)
-            if analytics_result is not None:
+        doc_scope = document_ids if document_ids else None
+        analytics_prefix = ""
+        if (
+            include_documents
+            and document_ids
+            and self._can_use_analytics()
+            and is_predictive_intent(query)
+        ):
+            rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
+                document_ids
+            )
+
+            def _doc_filename(did: str) -> str | None:
+                info = self._docs.get_document(did)
+                return info.filename if info else None
+
+            fc_res = resolve_forecast_for_chat(rows, get_filename=_doc_filename)
+            if isinstance(fc_res, ForecastChatPayload):
+                chart_spec = build_forecast_line_chart(fc_res)
+                payload_json = json.dumps(
+                    dataclasses.asdict(fc_res), indent=2, sort_keys=True
+                )
+                narr = await self._llm.complete(
+                    "You are a helpful analyst. In 2–4 sentences, summarize the baseline "
+                    "linear-trend forecast below for the user. Note that intervals are "
+                    "approximate (residual std × 1.96).",
+                    f"Forecast:\n{payload_json}\n\nUser question: {query}",
+                )
+                body = (narr.content or "").strip()
                 answer = (
-                    f"{analytics_result.summary}\n\n"
-                    f"**Data:** {json.dumps(analytics_result.data, default=str)}\n\n"
+                    f"{body}\n\n**Forecast (baseline)**\n```json\n{payload_json}\n```\n"
+                )
+                return ChatResult(
+                    answer=answer,
+                    mode="OFFLINE_ARCHIVE",
+                    contexts=[],
+                    attached_sources=[self._forecast_source_payload(fc_res)],
+                    forecast=dataclasses.asdict(fc_res),
+                    chart=chart_spec,
+                )
+            if isinstance(fc_res, ForecastUnavailable):
+                analytics_prefix = f"*{fc_res.hint}*\n\n"
+
+        if include_documents:
+            analytics_out = await self._try_analytics(query, document_ids)
+            if isinstance(analytics_out, AnalyticsUnavailable):
+                analytics_prefix = f"*{analytics_out.hint}*\n\n"
+            elif isinstance(analytics_out, AnalyticsResult):
+                answer = (
+                    f"{analytics_out.summary}\n\n"
+                    f"**Data:** {json.dumps(analytics_out.data, default=str)}\n\n"
                     f"Source: deterministic analytics"
                 )
-                return ChatResult(answer=answer, mode="OFFLINE_ARCHIVE", contexts=[])
+                return ChatResult(
+                    answer=answer,
+                    mode="OFFLINE_ARCHIVE",
+                    contexts=[],
+                    attached_sources=[self._analytics_source_payload(analytics_out)],
+                )
 
-        mode, contexts = await self._gather_contexts(query, prefer_mode, include_web, include_documents, document_ids)
+        mode, contexts = await self._gather_contexts(
+            query, prefer_mode, include_web, include_documents, doc_scope
+        )
         
         if mode == "OFFLINE_ARCHIVE":
             cached = await self._archive.get_cached_answer_async(query)
@@ -593,7 +690,11 @@ class ChatService:
                 resp = f"{cached.answer}\n\nSource: {cached.citation_url or 'cached answer'}"
                 if cached.evidence_quote:
                     resp += f"\nEvidence: {cached.evidence_quote}"
-                return ChatResult(f"{resp}\n(Cached from: {cached.timestamp})", mode, contexts)
+                return ChatResult(
+                    f"{analytics_prefix}{resp}\n(Cached from: {cached.timestamp})",
+                    mode,
+                    contexts,
+                )
         
         extraction = await self._llm.extract_json(self._extraction_prompt(contexts), query)
         if extraction and extraction.get("answer"):
@@ -603,48 +704,141 @@ class ChatService:
                 resp += f"\nEvidence: {ev}"
             if mode == "ONLINE":
                 await self._archive.save_answer_async(query, ans, cite, ev)
-            return ChatResult(resp, mode, contexts)
+            return ChatResult(f"{analytics_prefix}{resp}", mode, contexts)
         
         if mode in {"OFFLINE_ARCHIVE", "LOCAL_WEIGHTS"}:
             msg = "I could not verify the answer from the offline archive. Please try online mode or add a relevant source." if mode == "OFFLINE_ARCHIVE" else "I do not have any sources to answer this question. Please try online mode or add sources to the archive."
-            return ChatResult(msg, mode, contexts)
+            return ChatResult(f"{analytics_prefix}{msg}", mode, contexts)
         
         llm_resp = await self._llm.complete(self._answer_prompt(mode, contexts, include_documents), query)
         if llm_resp.content and mode == "ONLINE":
             await self._archive.save_answer_async(query, llm_resp.content, contexts[0].url if contexts else None, None)
-        return ChatResult(llm_resp.content, mode, contexts)
+        body = llm_resp.content or ""
+        return ChatResult(f"{analytics_prefix}{body}", mode, contexts)
     
     async def stream_answer(self, query: str, conversation_id: str, prefer_mode: str | None = None, include_web: bool = True, include_documents: bool = False, document_ids: list[str] | None = None) -> AsyncIterator[StreamEvent]:
         try:
-            if include_documents:
-                analytics_result = await self._try_analytics(query, document_ids)
-                if analytics_result is not None:
+            doc_scope = document_ids if document_ids else None
+            analytics_unavailable: dict[str, str] | None = None
+            stream_prefix = ""
+            if (
+                include_documents
+                and document_ids
+                and self._can_use_analytics()
+                and is_predictive_intent(query)
+            ):
+                rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
+                    document_ids
+                )
+
+                def _fn(did: str) -> str | None:
+                    info = self._docs.get_document(did)
+                    return info.filename if info else None
+
+                fc_res = resolve_forecast_for_chat(rows, get_filename=_fn)
+                if isinstance(fc_res, ForecastChatPayload):
+                    chart_spec = build_forecast_line_chart(fc_res)
+                    payload_json = json.dumps(
+                        dataclasses.asdict(fc_res), indent=2, sort_keys=True
+                    )
+                    narr = await self._llm.complete(
+                        "You are a helpful analyst. In 2–4 sentences, summarize the baseline "
+                        "linear-trend forecast below for the user. Note that intervals are "
+                        "approximate (residual std × 1.96).",
+                        f"Forecast:\n{payload_json}\n\nUser question: {query}",
+                    )
+                    body = (narr.content or "").strip()
                     answer = (
-                        f"{analytics_result.summary}\n\n"
-                        f"**Data:** {json.dumps(analytics_result.data, default=str)}\n\n"
+                        f"{body}\n\n**Forecast (baseline)**\n```json\n{payload_json}\n```\n"
+                    )
+                    fd = dataclasses.asdict(fc_res)
+                    yield StreamEvent(
+                        "meta",
+                        {
+                            "mode": "OFFLINE_ARCHIVE",
+                            "sources": [self._forecast_source_payload(fc_res)],
+                            "conversation_id": conversation_id,
+                            "forecast": fd,
+                            "chart": chart_spec,
+                        },
+                    )
+                    yield StreamEvent("token", {"text": answer})
+                    yield StreamEvent(
+                        "done",
+                        {
+                            "final_text": answer,
+                            "forecast": fd,
+                            "chart": chart_spec,
+                        },
+                    )
+                    return
+                if isinstance(fc_res, ForecastUnavailable):
+                    stream_prefix = f"*{fc_res.hint}*\n\n"
+
+            if include_documents:
+                analytics_out = await self._try_analytics(query, document_ids)
+                if isinstance(analytics_out, AnalyticsUnavailable):
+                    analytics_unavailable = {
+                        "reason": analytics_out.reason,
+                        "hint": analytics_out.hint,
+                    }
+                    hint = f"*{analytics_out.hint}*\n\n"
+                    stream_prefix = stream_prefix + hint if stream_prefix else hint
+                elif isinstance(analytics_out, AnalyticsResult):
+                    answer = (
+                        f"{analytics_out.summary}\n\n"
+                        f"**Data:** {json.dumps(analytics_out.data, default=str)}\n\n"
                         f"Source: deterministic analytics"
                     )
-                    yield StreamEvent("meta", {"mode": "OFFLINE_ARCHIVE", "sources": [{"url": "analytics://tabular", "snippet": analytics_result.summary, "retrieval_type": "document_keyword", "source_type": "document"}], "conversation_id": conversation_id})
+                    yield StreamEvent(
+                        "meta",
+                        {
+                            "mode": "OFFLINE_ARCHIVE",
+                            "sources": [self._analytics_source_payload(analytics_out)],
+                            "conversation_id": conversation_id,
+                        },
+                    )
                     yield StreamEvent("token", {"text": answer})
                     yield StreamEvent("done", {"final_text": answer})
                     return
 
-            mode, contexts = await self._gather_contexts(query, prefer_mode, include_web, include_documents, document_ids)
+            mode, contexts = await self._gather_contexts(
+                query, prefer_mode, include_web, include_documents, doc_scope
+            )
             sources = [context_to_source_dict(c, determine_retrieval_type(mode, self._s.offline_retrieval_mode, c.is_document_source()), self._archive.hash_url) for c in contexts if c.url != FALLBACK_SOURCE_URL]
-            yield StreamEvent("meta", {"mode": mode, "sources": sources, "conversation_id": conversation_id})
+            meta_payload: dict[str, Any] = {
+                "mode": mode,
+                "sources": sources,
+                "conversation_id": conversation_id,
+            }
+            if analytics_unavailable is not None:
+                meta_payload["analytics_unavailable"] = analytics_unavailable
+            yield StreamEvent("meta", meta_payload)
             
             full_resp = ""
+            prefix_sent = False
             try:
                 async for chunk in self._llm.stream(self._answer_prompt(mode, contexts, include_documents), query):
                     if chunk.content:
-                        full_resp += chunk.content
-                        yield StreamEvent("token", {"text": chunk.content})
+                        text = chunk.content
+                        if stream_prefix and not prefix_sent:
+                            text = stream_prefix + text
+                            prefix_sent = True
+                        full_resp += text
+                        yield StreamEvent("token", {"text": text})
                     if chunk.is_done:
                         break
             except Exception:
                 resp = await self._llm.complete(self._answer_prompt(mode, contexts, include_documents), query)
-                full_resp = resp.content
-                yield StreamEvent("token", {"text": full_resp})
+                body = resp.content or ""
+                if stream_prefix and not prefix_sent:
+                    body = stream_prefix + body
+                    prefix_sent = True
+                full_resp = body
+                yield StreamEvent("token", {"text": body})
+            if stream_prefix and not prefix_sent:
+                full_resp = stream_prefix + full_resp
+                yield StreamEvent("token", {"text": stream_prefix})
             yield StreamEvent("done", {"final_text": full_resp})
         except Exception as e:
             yield StreamEvent("error", {"code": ErrorCode.STREAM_ERROR, "message": str(e)})

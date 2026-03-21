@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Union
 
 from pydantic import BaseModel, Field, model_validator
@@ -102,6 +102,12 @@ class ColumnProfile(BaseModel):
     distinct_count: int
     min_value: float | int | str | None = None
     max_value: float | int | str | None = None
+    dtype: str | None = None
+    missing_count: int | None = None
+    mean_value: float | None = None
+    median_value: float | None = None
+    std_value: float | None = None
+    top_values: dict[str, int] | None = None
 
 
 class DatasetProfile(BaseModel):
@@ -116,3 +122,38 @@ class AnalyticsResult(BaseModel):
     sql: str
     parameters: list[object]
     data: dict
+    document_id: str | None = None
+    sheet_name: str | None = None
+
+
+@dataclass(frozen=True)
+class AnalyticsUnavailable:
+    """Scoped analytics cannot run (e.g. no tabular metadata for selected documents)."""
+
+    reason: str
+    document_ids: list[str] = field(default_factory=list)
+    hint: str = "Select a document that contains tabular data."
+
+
+@dataclass(frozen=True)
+class ForecastUnavailable:
+    reason: str
+    hint: str = (
+        "Upload an Excel file with a date column and numeric measures, then try again."
+    )
+
+
+@dataclass(frozen=True)
+class ForecastChatPayload:
+    """Structured forecast for API / SSE responses."""
+
+    document: str | None
+    document_id: str
+    sheet: str
+    measure: str
+    time_column: str
+    horizon: int
+    point: list[float]
+    lower: list[float]
+    upper: list[float]
+    model: str
