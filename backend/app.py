@@ -14,7 +14,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import AsyncGenerator, Literal
+from typing import Any, AsyncGenerator, Literal
 
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -59,6 +59,10 @@ class Source(BaseModel):
     source_type: Literal["web", "document"] = "web"
     filename: str | None = None
     location: SourceLocation | None = None
+    source_kind: Literal["web", "document", "analytics", "archive"] | None = None
+    document_id: str | None = None
+    display_name: str | None = None
+    sheet_name: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -77,12 +81,27 @@ class TimingInfo(BaseModel):
     total_ms: int = 0
 
 
+class ForecastResponseModel(BaseModel):
+    document: str | None = None
+    document_id: str
+    sheet: str
+    measure: str
+    time_column: str
+    horizon: int
+    point: list[float]
+    lower: list[float]
+    upper: list[float]
+    model: str
+
+
 class ChatResponse(BaseModel):
     conversation_id: str
     answer: str
     mode: Literal["ONLINE", "OFFLINE_ARCHIVE", "LOCAL_WEIGHTS"]
     sources: list[Source]
     timing: TimingInfo
+    forecast: ForecastResponseModel | None = None
+    chart: dict[str, Any] | None = None
 
 
 class ArchiveEntryModel(BaseModel):
@@ -349,8 +368,24 @@ async def chat(request: ChatRequest) -> ChatResponse:
         result = await _chat_service().get_answer(request.query, request.prefer_mode, request.include_web, request.include_documents, request.document_ids)
     except Exception as e:
         raise HTTPException(500, {"code": ErrorCode.LLM_ERROR, "message": str(e)})
-    sources = [_source_to_model(s) for s in _chat_service().convert_contexts_to_sources(result.contexts, result.mode)]
-    return ChatResponse(conversation_id=conv_id, answer=result.answer, mode=result.mode, sources=sources, timing=TimingInfo(total_ms=int((time.perf_counter() - start) * 1000)))
+    if result.attached_sources is not None:
+        sources = [_source_to_model(s) for s in result.attached_sources]
+    else:
+        sources = [_source_to_model(s) for s in _chat_service().convert_contexts_to_sources(result.contexts, result.mode)]
+    forecast_out = (
+        ForecastResponseModel.model_validate(result.forecast)
+        if result.forecast is not None
+        else None
+    )
+    return ChatResponse(
+        conversation_id=conv_id,
+        answer=result.answer,
+        mode=result.mode,
+        sources=sources,
+        timing=TimingInfo(total_ms=int((time.perf_counter() - start) * 1000)),
+        forecast=forecast_out,
+        chart=result.chart,
+    )
 
 
 @app.post("/api/chat/stream")

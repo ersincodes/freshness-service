@@ -14,6 +14,8 @@ export type RetrievalType = "online" | "offline_keyword" | "offline_semantic" | 
 
 export type SourceType = "web" | "document";
 
+export type SourceKind = "web" | "document" | "analytics" | "archive";
+
 export type DocumentType = "pdf" | "xlsx" | "xls";
 
 export type DocumentStatus = "pending" | "processing" | "ready" | "error";
@@ -43,6 +45,10 @@ export interface Source {
   source_type?: SourceType;
   filename?: string;
   location?: SourceLocation;
+  source_kind?: SourceKind;
+  document_id?: string;
+  display_name?: string;
+  sheet_name?: string;
 }
 
 // ============================================================================
@@ -72,13 +78,57 @@ export interface ChatResponse {
   mode: RetrievalMode;
   sources: Source[];
   timing: TimingInfo;
+  forecast?: ForecastPayload;
+  chart?: ChartSpec;
 }
 
 // SSE Event Types
+export interface ChartDataPoint {
+  date: string;
+  value: number;
+}
+
+export interface ChartSeriesConfidence {
+  lower: ChartDataPoint[];
+  upper: ChartDataPoint[];
+}
+
+export interface ChartSeriesSpec {
+  name: string;
+  style: "solid" | "dashed";
+  data: ChartDataPoint[];
+  confidence_band?: ChartSeriesConfidence;
+}
+
+export interface ChartSpec {
+  type: "line_chart" | "bar_chart";
+  title: string;
+  x_label: string;
+  y_label: string;
+  series: ChartSeriesSpec[];
+  forecast_start?: string;
+}
+
+export interface ForecastPayload {
+  document?: string | null;
+  document_id: string;
+  sheet: string;
+  measure: string;
+  time_column: string;
+  horizon: number;
+  point: number[];
+  lower: number[];
+  upper: number[];
+  model: string;
+}
+
 export interface ChatStreamMetaEvent {
   mode: RetrievalMode;
   sources: Source[];
   conversation_id: string;
+  analytics_unavailable?: { reason: string; hint: string };
+  forecast?: ForecastPayload;
+  chart?: ChartSpec;
 }
 
 export interface ChatStreamTokenEvent {
@@ -87,6 +137,8 @@ export interface ChatStreamTokenEvent {
 
 export interface ChatStreamDoneEvent {
   final_text: string;
+  forecast?: ForecastPayload;
+  chart?: ChartSpec;
 }
 
 export interface ChatStreamErrorEvent {
@@ -107,6 +159,9 @@ export interface ChatTurn {
   sources?: Source[];
   error?: { code: string; message: string };
   isStreaming?: boolean;
+  /** Snapshot: chat request asked for document context */
+  requestIncludeDocuments?: boolean;
+  chart?: ChartSpec;
 }
 
 export interface Conversation {

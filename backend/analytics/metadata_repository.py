@@ -122,6 +122,61 @@ class MetadataRepository:
             )
         return result
 
+    def list_tables_for_documents(
+        self, document_ids: list[str]
+    ) -> list[tuple[str, str, str, int]]:
+        """Return (document_id, sheet_name, table_name, row_count) for given documents."""
+        if not document_ids:
+            return []
+        placeholders = ",".join("?" for _ in document_ids)
+        cur = self._conn.execute(
+            f"SELECT document_id, sheet_name, table_name, row_count FROM document_tables "
+            f"WHERE document_id IN ({placeholders}) "
+            "ORDER BY document_id, sheet_name;",
+            tuple(document_ids),
+        )
+        return [(str(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in cur.fetchall()]
+
+    def list_columns_for_documents(
+        self, document_ids: list[str]
+    ) -> dict[str, list[ColumnMetadata]]:
+        """Return columns grouped by document_id, ordered by sheet_name and ordinal."""
+        if not document_ids:
+            return {}
+        placeholders = ",".join("?" for _ in document_ids)
+        cur = self._conn.execute(
+            f"SELECT document_id, original_name, safe_name, logical_type, sqlite_type, nullable "
+            f"FROM document_table_columns "
+            f"WHERE document_id IN ({placeholders}) "
+            "ORDER BY document_id, sheet_name, ordinal ASC;",
+            tuple(document_ids),
+        )
+        out: dict[str, list[ColumnMetadata]] = {}
+        for row in cur.fetchall():
+            doc_id = str(row[0])
+            original_name = str(row[1])
+            col = ColumnMetadata(
+                column_name=original_name,
+                logical_type=str(row[3]) or "string",
+                sqlite_type=str(row[4]) or "TEXT",
+                nullable=bool(row[5]),
+                original_name=original_name,
+                safe_name=str(row[2]),
+            )
+            out.setdefault(doc_id, []).append(col)
+        return out
+
+    def list_all_tables(self) -> list[tuple[str, str, str, int]]:
+        """All registered tables for ready documents (document_id, sheet_name, table_name, row_count)."""
+        cur = self._conn.execute(
+            "SELECT dt.document_id, dt.sheet_name, dt.table_name, dt.row_count "
+            "FROM document_tables dt "
+            "INNER JOIN documents d ON dt.document_id = d.document_id "
+            "WHERE d.status = 'ready' "
+            "ORDER BY dt.document_id, dt.sheet_name;"
+        )
+        return [(str(r[0]), str(r[1]), str(r[2]), int(r[3])) for r in cur.fetchall()]
+
     # ------------------------------------------------------------------
     # Profiles
     # ------------------------------------------------------------------
@@ -139,6 +194,37 @@ class MetadataRepository:
                 "DO UPDATE SET row_count = excluded.row_count, "
                 "  profile_json = excluded.profile_json, updated_at = datetime('now');",
                 (document_id, sheet_name, profile.row_count, profile_json),
+            )
+
+    def upsert_timeseries_meta(
+        self,
+        document_id: str,
+        sheet_name: str,
+        time_column: str | None,
+        measures_json: str,
+        eligible_for_forecast: int,
+        ineligibility_reason: str | None,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO timeseries_meta "
+                "(document_id, sheet_name, time_column, measures_json, "
+                " eligible_for_forecast, ineligibility_reason, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, datetime('now')) "
+                "ON CONFLICT(document_id, sheet_name) DO UPDATE SET "
+                "  time_column = excluded.time_column, "
+                "  measures_json = excluded.measures_json, "
+                "  eligible_for_forecast = excluded.eligible_for_forecast, "
+                "  ineligibility_reason = excluded.ineligibility_reason, "
+                "  updated_at = datetime('now');",
+                (
+                    document_id,
+                    sheet_name,
+                    time_column,
+                    measures_json,
+                    eligible_for_forecast,
+                    ineligibility_reason,
+                ),
             )
 
     def get_profile(
@@ -207,6 +293,14 @@ class MetadataRepository:
             )
             self._conn.execute(
                 "DELETE FROM document_tables WHERE document_id = ?;",
+                (document_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM timeseries_meta WHERE document_id = ?;",
+                (document_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM forecast_artifacts WHERE document_id = ?;",
                 (document_id,),
             )
 

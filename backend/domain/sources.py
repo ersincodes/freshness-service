@@ -43,6 +43,11 @@ def determine_retrieval_type(mode: RetrievalMode, offline_mode: str, is_document
 def context_to_source_dict(ctx: SourceContext, retrieval_type: RetrievalType, url_hash_fn: callable | None = None) -> dict[str, Any]:
     """Convert SourceContext to API response dict."""
     is_doc = ctx.is_document_source()
+    doc_id = (
+        ctx.url[len(DOC_URL_PREFIX) :]
+        if is_doc and ctx.url.startswith(DOC_URL_PREFIX)
+        else None
+    )
     result: dict[str, Any] = {
         "url": ctx.url,
         "snippet": ctx.text[:500] if ctx.text else "",
@@ -53,6 +58,10 @@ def context_to_source_dict(ctx: SourceContext, retrieval_type: RetrievalType, ur
         "filename": ctx.filename if is_doc else None,
         "location": {"page": ctx.metadata.get("page"), "sheet": ctx.metadata.get("sheet"),
                      "row_start": ctx.metadata.get("row_start"), "row_end": ctx.metadata.get("row_end")} if is_doc and ctx.metadata else None,
+        "source_kind": "document" if is_doc else "web",
+        "document_id": doc_id,
+        "display_name": (ctx.filename or doc_id or "Document") if is_doc else None,
+        "sheet_name": ctx.metadata.get("sheet") if is_doc and ctx.metadata else None,
     }
     return result
 

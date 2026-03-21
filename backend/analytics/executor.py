@@ -8,6 +8,7 @@ from .errors import (
     AnalyticsPlanValidationError,
     AnalyticsRoutingError,
 )
+from .forecast_repository import ForecastRepository
 from .metadata_repository import MetadataRepository
 from .models import AnalyticsPlan, AnalyticsResult, DatasetProfile
 from .sql_compiler import compile_plan
@@ -21,10 +22,15 @@ class AnalyticsExecutor:
 
     def __init__(self, metadata_repo: MetadataRepository) -> None:
         self._meta = metadata_repo
+        self._forecast_repo = ForecastRepository(metadata_repo._conn)
 
     @property
     def metadata_repo(self) -> MetadataRepository:
         return self._meta
+
+    @property
+    def forecast_repo(self) -> ForecastRepository:
+        return self._forecast_repo
 
     def execute(self, plan: AnalyticsPlan) -> AnalyticsResult:
         document_id = plan.document_id
@@ -65,6 +71,8 @@ class AnalyticsExecutor:
             sql=compiled.sql,
             parameters=list(compiled.parameters),
             data=result_data,
+            document_id=document_id,
+            sheet_name=sheet_name,
         )
 
     def _format_result(self, plan: AnalyticsPlan, rows: list) -> dict:
