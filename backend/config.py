@@ -49,7 +49,10 @@ class Settings:
     chroma_dir: str
     embed_model_name: str
     semantic_top_k: int
+    # Brave, scraping, asyncio.fetch (seconds)
     request_timeout_s: int
+    # LM Studio / OpenAI-compatible chat completions (seconds; local models often need 60+)
+    llm_request_timeout_s: int
     max_chars_per_source: int
     # Document upload settings
     upload_dir: str
@@ -79,7 +82,8 @@ settings = Settings(
         "EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
     ),
     semantic_top_k=_getenv_int("SEMANTIC_TOP_K", 3),
-    request_timeout_s=_getenv_int("REQUEST_TIMEOUT_S", 10),
+    request_timeout_s=_getenv_int("REQUEST_TIMEOUT_S", 30),
+    llm_request_timeout_s=_getenv_int("LLM_REQUEST_TIMEOUT_S", 180),
     max_chars_per_source=_getenv_int("MAX_CHARS_PER_SOURCE", 2000),
     upload_dir=os.getenv("UPLOAD_DIR", "uploads"),
     max_upload_mb=_getenv_int("MAX_UPLOAD_MB", 25),
@@ -123,6 +127,9 @@ def get_settings() -> Settings:
         request_timeout_s=_RUNTIME_OVERRIDES.get(
             "request_timeout_s", base.request_timeout_s
         ),
+        llm_request_timeout_s=_RUNTIME_OVERRIDES.get(
+            "llm_request_timeout_s", base.llm_request_timeout_s
+        ),
         max_chars_per_source=_RUNTIME_OVERRIDES.get(
             "max_chars_per_source", base.max_chars_per_source
         ),
@@ -158,6 +165,7 @@ def update_settings(overrides: dict[str, Any]) -> Settings:
         "max_search_results",
         "semantic_top_k",
         "request_timeout_s",
+        "llm_request_timeout_s",
         "max_chars_per_source",
         "web_top_k",
         "doc_semantic_top_k",

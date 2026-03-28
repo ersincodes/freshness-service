@@ -16,8 +16,16 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-_OPS_REQUIRING_TARGET = {"count_distinct", "sum", "avg", "min", "max", "groupby_sum"}
-_NUMERIC_AGGREGATES = {"sum", "avg", "groupby_sum"}
+_OPS_REQUIRING_TARGET = {
+    "count_distinct",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "groupby_sum",
+    "groupby_ratio",
+}
+_NUMERIC_AGGREGATES = {"sum", "avg", "groupby_sum", "groupby_ratio"}
 
 
 def validate_plan(
@@ -48,24 +56,63 @@ def validate_plan(
                 f"but '{plan.target_column}' is '{meta.logical_type}'"
             )
 
+    if plan.operation == "groupby_ratio" and plan.denominator_column:
+        dmeta = visible_columns.get(plan.denominator_column)
+        if not dmeta:
+            raise AnalyticsPlanValidationError(
+                f"denominator_column '{plan.denominator_column}' not found in columns"
+            )
+        if dmeta.logical_type not in ("integer", "float"):
+            raise AnalyticsPlanValidationError(
+                f"groupby_ratio denominator '{plan.denominator_column}' must be numeric"
+            )
+
+    tg = getattr(plan, "time_grain", "none") or "none"
+    if tg != "none" and plan.operation not in ("groupby_sum", "groupby_count"):
+        raise AnalyticsPlanValidationError(
+            "time_grain is only supported for groupby_sum and groupby_count"
+        )
+    if tg != "none" and not plan.time_column:
+        raise AnalyticsPlanValidationError("time_grain requires time_column")
+    if plan.time_column and plan.time_column not in visible_columns:
+        raise AnalyticsPlanValidationError(
+            f"time_column '{plan.time_column}' not found in columns"
+        )
+    if tg != "none" and plan.time_column:
+        tc_meta = visible_columns[plan.time_column]
+        if tc_meta.logical_type != "date":
+            raise AnalyticsPlanValidationError(
+                f"time_column '{plan.time_column}' must have logical type date"
+            )
+
     if plan.operation == "groupby_count":
         group_col = plan.group_by or plan.target_column
-        if not group_col:
+        if tg == "none" and not group_col:
             raise AnalyticsPlanValidationError(
-                "groupby_count requires group_by or target_column"
+                "groupby_count requires group_by or target_column (unless using time_grain)"
             )
-        if group_col not in visible_columns:
+        if group_col and group_col not in visible_columns:
             raise AnalyticsPlanValidationError(
                 f"group_by column '{group_col}' not found in columns"
             )
 
     if plan.operation == "groupby_sum":
-        if not plan.group_by:
+        if tg == "none" and not plan.group_by:
             raise AnalyticsPlanValidationError("groupby_sum requires group_by")
+        if plan.group_by and plan.group_by not in visible_columns:
+            raise AnalyticsPlanValidationError(
+                f"group_by column '{plan.group_by}' not found in columns"
+            )
+
+    if plan.operation == "groupby_ratio":
+        if not plan.group_by:
+            raise AnalyticsPlanValidationError("groupby_ratio requires group_by")
         if plan.group_by not in visible_columns:
             raise AnalyticsPlanValidationError(
                 f"group_by column '{plan.group_by}' not found in columns"
             )
+        if not plan.denominator_column:
+            raise AnalyticsPlanValidationError("groupby_ratio requires denominator_column")
 
     if plan.operation == "select_rows" and plan.select_columns:
         for col in plan.select_columns:

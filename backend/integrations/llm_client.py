@@ -101,7 +101,11 @@ class LLMClient:
         """Check if LLM service is healthy."""
         try:
             start = time.perf_counter()
-            resp = await asyncio.to_thread(lambda: requests.get(f"{self._base_url}/models", timeout=5))
+            # /models can be slow on first LM Studio load; cap so health checks do not hang forever
+            health_timeout = min(45, max(10, self._timeout))
+            resp = await asyncio.to_thread(
+                lambda: requests.get(f"{self._base_url}/models", timeout=health_timeout)
+            )
             latency_ms = int((time.perf_counter() - start) * 1000)
             if resp.status_code == 200:
                 return True, "LM Studio is reachable", latency_ms

@@ -421,6 +421,50 @@ def process_document(
 # Tabular Analytics Ingestion (SQLite)
 # ============================================================================
 
+_CURRENCY_STRIP_RE = re.compile(r"[\$,€£¥₹\u00a0\u202f]")
+
+
+def _strip_currency_for_numeric_parse(value: Any) -> str | None:
+    """Normalize common spreadsheet currency strings for float/int parsing.
+
+    Handles $, commas, spaces, NBSP, and (1234.56) accounting negatives.
+    Returns a string suitable for float(), or None if empty / not parseable as number.
+    """
+    if value is None:
+        return None
+    if pd is not None and pd.isna(value):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+    s = _CURRENCY_STRIP_RE.sub("", s)
+    s = s.replace(",", "").replace(" ", "")
+    if s.endswith("%"):
+        s = s[:-1].strip()
+    if not s or s in {"-", ".", "-."}:
+        return None
+    if neg:
+        if s.startswith("-"):
+            s = s[1:]
+        s = "-" + s
+    return s
+
+
+def _coerce_loose_numeric_for_inference(value: Any) -> float:
+    """Single-cell numeric coercion for type inference; NaN if not numeric."""
+    t = _strip_currency_for_numeric_parse(value)
+    if t is None:
+        return float("nan")
+    try:
+        return float(t)
+    except ValueError:
+        return float("nan")
+
+
 def _infer_logical_type(series: Any) -> str:
     """Infer a LogicalType for a pandas Series.
 
@@ -470,7 +514,7 @@ def _infer_logical_type(series: Any) -> str:
             return "integer"
         return "float"
     if is_string_dtype:
-        coerced = pd.to_numeric(non_null, errors="coerce")
+        coerced = non_null.map(_coerce_loose_numeric_for_inference)
         if coerced.notna().sum() / len(non_null) >= 0.9:
             if (coerced.dropna() == coerced.dropna().astype(int)).all():
                 return "integer"
@@ -521,12 +565,22 @@ def _normalize_cell_value(x: Any, logical_type: str) -> Any:
 
     if logical_type == "integer":
         try:
+            if isinstance(x, str):
+                stripped = _strip_currency_for_numeric_parse(x)
+                if stripped is None:
+                    return None
+                x = stripped
             return int(float(x))
         except (ValueError, TypeError):
             return None
 
     if logical_type == "float":
         try:
+            if isinstance(x, str):
+                stripped = _strip_currency_for_numeric_parse(x)
+                if stripped is None:
+                    return None
+                x = stripped
             return float(x)
         except (ValueError, TypeError):
             return None

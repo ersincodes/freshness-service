@@ -65,7 +65,8 @@ def profile_dataframe(
                 pass
         else:
             if not non_null.empty:
-                vc = non_null.astype(str).value_counts().head(5)
+                # Top frequent strings for planner prompts (wider than before for vocabulary coverage).
+                vc = non_null.astype(str).value_counts().head(20)
                 top_values = {str(k): int(v) for k, v in vc.items()}
 
         columns[col_name] = ColumnProfile(

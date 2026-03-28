@@ -144,6 +144,300 @@ def infer_select_rows_limit_from_query(query: str) -> int | None:
     return None
 
 
+def _format_analytics_numeric_hints(profile: DatasetProfile | None) -> str:
+    """One line per numeric column from the stored profile (helps pick revenue vs quantity)."""
+    if profile is None:
+        return ""
+    lines: list[str] = []
+    for name in sorted(profile.columns.keys()):
+        cp = profile.columns[name]
+        if cp.logical_type not in ("integer", "float"):
+            continue
+        bits: list[str] = []
+        if cp.mean_value is not None:
+            bits.append(f"mean≈{cp.mean_value}")
+        if cp.min_value is not None:
+            bits.append(f"min={cp.min_value}")
+        if cp.max_value is not None:
+            bits.append(f"max={cp.max_value}")
+        if bits:
+            lines.append(f"  - {name}: {', '.join(bits)}")
+    return "\n".join(lines) if lines else ""
+
+
+def _first_volume_like_numeric_column(
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> str | None:
+    vol_tokens = ("quantity", "units", "qty", "volume")
+    for c in column_names:
+        if column_types.get(c) not in ("integer", "float"):
+            continue
+        n = c.lower().replace("_", " ")
+        if any(t in n for t in vol_tokens):
+            return c
+    return None
+
+
+def _volume_question_prefers_sum_not_rowcount(query: str) -> bool:
+    """True when 'most X' means total units/revenue, not COUNT(*)."""
+    q = query.lower()
+    if re.search(
+        r"\b(how many|number of|count of)\b.{0,40}\b(order|transaction|row|record)s?\b",
+        q,
+    ):
+        return False
+    if re.search(r"\bmost\s+(orders?|transactions?|rows?|records?)\b", q):
+        return False
+    if re.search(
+        r"\b(buys?|bought|purchase|purchased|ordered|order(s)?\s+(of|for))\b",
+        q,
+    ):
+        return True
+    if re.search(
+        r"\b(most|largest|highest|greatest|biggest)\b.{0,60}\b"
+        r"(quantity|quantities|units|qty|volume|fruit|fruits|vegetable|product)\b",
+        q,
+    ):
+        return True
+    if re.search(
+        r"\b(quantity|quantities|units|qty|volume)\b.{0,40}\b(most|largest|highest)\b",
+        q,
+    ):
+        return True
+    return False
+
+
+def _repair_rowcount_plan_to_quantity_sum(
+    plan: AnalyticsPlan,
+    user_query: str,
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> AnalyticsPlan:
+    """If the model used row counts for a volume-style question, switch to groupby_sum."""
+    if plan.operation != "groupby_count":
+        return plan
+    if not _volume_question_prefers_sum_not_rowcount(user_query):
+        return plan
+    vol = _first_volume_like_numeric_column(column_names, column_types)
+    if not vol:
+        return plan
+    group_dim = plan.group_by or plan.target_column
+    if not group_dim:
+        return plan
+    return plan.model_copy(
+        update={
+            "operation": "groupby_sum",
+            "target_column": vol,
+            "group_by": group_dim,
+            "order": "value_desc",
+        }
+    )
+
+
+def _superlative_which_who_groupby_query(query: str) -> bool:
+    """True for which/who + superlative + a plausible aggregate measure in one question."""
+    q = query.lower()
+    if not re.search(r"\b(which|who)\b", q):
+        return False
+    if not re.search(
+        r"\b(most|highest|best|top|largest|greatest|biggest)\b", q,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(profit|revenue|sales|margin|quantity|units|qty|volume|amount|income)\b",
+            q,
+        )
+    )
+
+
+def _normalize_header_name(name: str) -> str:
+    return re.sub(r"\s+", " ", name.lower().replace("_", " ")).strip()
+
+
+def _header_matches_salesperson_dimension(norm: str) -> bool:
+    """norm is lowercase header with spaces (underscores collapsed)."""
+    compact = norm.replace(" ", "")
+    if "salesperson" in norm or "sales person" in norm:
+        return True
+    if "salesrep" in compact:
+        return True
+    if re.search(r"\bsales\s+rep\b", norm):
+        return True
+    if "representative" in norm and "product" not in norm:
+        return True
+    if re.search(r"\bemployee\b", norm) and "count" not in norm:
+        return True
+    if "associate" in norm and "product" not in norm:
+        return True
+    return False
+
+
+def _first_salesperson_like_string_column(
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> str | None:
+    for c in column_names:
+        if column_types.get(c) != "string":
+            continue
+        if _header_matches_salesperson_dimension(_normalize_header_name(c)):
+            return c
+    return None
+
+
+def _first_numeric_column_matching_name_tokens(
+    column_names: list[str],
+    column_types: dict[str, str],
+    tokens: tuple[str, ...],
+) -> str | None:
+    for c in column_names:
+        if column_types.get(c) not in ("integer", "float"):
+            continue
+        n = _normalize_header_name(c)
+        if any(t in n for t in tokens):
+            return c
+    return None
+
+
+def _first_money_like_numeric_column(
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> str | None:
+    vol_tokens = ("quantity", "units", "qty", "volume")
+    money_tokens = (
+        "revenue",
+        "sales",
+        "profit",
+        "amount",
+        "cost",
+        "price",
+        "margin",
+        "total",
+        "subtotal",
+        "line total",
+    )
+    for c in column_names:
+        if column_types.get(c) not in ("integer", "float"):
+            continue
+        n = _normalize_header_name(c)
+        if any(t in n for t in vol_tokens):
+            continue
+        if any(t in n for t in money_tokens):
+            return c
+    return None
+
+
+def _pick_superlative_measure_column(
+    user_query: str,
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> str | None:
+    q = user_query.lower()
+    if re.search(r"\b(profit|profitable|margin)\b", q):
+        m = _first_numeric_column_matching_name_tokens(
+            column_names,
+            column_types,
+            ("profit", "margin", "net income", "ebitda"),
+        )
+        if m:
+            return m
+    if re.search(
+        r"\b(quantity|quantities|units|qty|volume)\b.{0,60}\b(most|highest|top|largest|greatest|biggest)\b",
+        q,
+    ) or re.search(
+        r"\b(most|highest|top|largest|greatest|biggest)\b.{0,60}\b(quantity|quantities|units|qty|volume)\b",
+        q,
+    ):
+        v = _first_volume_like_numeric_column(column_names, column_types)
+        if v:
+            return v
+    return (
+        _first_money_like_numeric_column(column_names, column_types)
+        or _first_volume_like_numeric_column(column_names, column_types)
+    )
+
+
+def _repair_select_rows_to_groupby_superlative(
+    plan: AnalyticsPlan,
+    user_query: str,
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> AnalyticsPlan:
+    """If the model used select_rows for a which/who + superlative + metric question, use groupby_sum."""
+    if plan.operation != "select_rows":
+        return plan
+    if not _superlative_which_who_groupby_query(user_query):
+        return plan
+    measure = _pick_superlative_measure_column(
+        user_query, column_names, column_types
+    )
+    group_dim = _first_salesperson_like_string_column(column_names, column_types)
+    if not measure or not group_dim:
+        return plan
+    top_n = 1
+    return plan.model_copy(
+        update={
+            "operation": "groupby_sum",
+            "target_column": measure,
+            "group_by": group_dim,
+            "order": "value_desc",
+            "top_n": top_n,
+            "select_columns": None,
+        }
+    )
+
+
+def _format_suggested_measure_picks(
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> str:
+    """Name-based hints so 'buys the most' maps to SUM(quantity) not COUNT(rows)."""
+    vol_tokens = ("quantity", "units", "qty", "volume")
+    money_tokens = (
+        "revenue",
+        "sales",
+        "profit",
+        "amount",
+        "cost",
+        "price",
+        "margin",
+        "total",
+        "subtotal",
+        "line total",
+    )
+    vol_col: str | None = None
+    money_col: str | None = None
+    for c in column_names:
+        if column_types.get(c) not in ("integer", "float"):
+            continue
+        n = c.lower().replace("_", " ")
+        is_volumeish = any(t in n for t in vol_tokens)
+        if vol_col is None and is_volumeish:
+            vol_col = c
+        if money_col is None and not is_volumeish:
+            if any(t in n for t in money_tokens):
+                money_col = c
+    lines: list[str] = []
+    if vol_col:
+        lines.append(
+            f"  - For how much product / units / 'buys the most' / ordered quantity: "
+            f"use operation groupby_sum with target_column={vol_col!r} — never use "
+            f"groupby_count for that intent (counts rows, not units)."
+        )
+    if money_col:
+        lines.append(
+            f"  - For spend / revenue / sales / money totals: use groupby_sum with "
+            f"target_column={money_col!r}."
+        )
+    if not lines:
+        return ""
+    return (
+        "\n\nSUGGESTED MEASURE COLUMNS (superlatives over customers/regions/products):\n"
+        + "\n".join(lines)
+    )
+
+
 def apply_select_rows_limit_from_user_query(plan: AnalyticsPlan, user_query: str) -> AnalyticsPlan:
     """When the user explicitly asks for N rows, override planner limit (capped at 500)."""
     if plan.operation != "select_rows":
@@ -293,6 +587,11 @@ class ChatService:
         column_names: list[str],
         document_id: str,
         column_types: dict[str, str] | None = None,
+        *,
+        profile_values: dict[str, list[str]] | None = None,
+        suggested_time_column: str | None = None,
+        numeric_hints: str = "",
+        measure_pick_hints: str = "",
     ) -> str:
         if column_types:
             cols_block = "\n".join(
@@ -300,6 +599,32 @@ class ChatService:
             )
         else:
             cols_block = "\n".join(f"  - {c}" for c in column_names)
+        values_block = ""
+        if profile_values:
+            parts = [
+                f"  - {col}: {', '.join(vals)}"
+                for col, vals in sorted(profile_values.items())
+            ]
+            values_block = (
+                "\n\nKNOWN CATEGORICAL VALUES (use exact spelling for eq filters; "
+                "or contains with a minimal substring if needed):\n" + "\n".join(parts)
+            )
+        time_block = ""
+        if suggested_time_column:
+            time_block = (
+                f"\n\nDETECTED DATE COLUMN (for trends / seasonality): {suggested_time_column!r}\n"
+                "Use it as time_column with time_grain month, year, or week when the user asks "
+                "for monthly/yearly/seasonal patterns or trends over time.\n"
+            )
+        numeric_block = ""
+        if numeric_hints.strip():
+            numeric_block = (
+                "\n\nNUMERIC COLUMN HINTS (choose measures that match the question):\n"
+                + numeric_hints
+                + "\nFor spend/revenue/sales/money wording, prefer columns whose names suggest "
+                "revenue, sales, amount, price, total, or cost. "
+                "For units/volume/sold/quantity wording, prefer quantity, units, qty, volume.\n"
+            )
         return (
             "You are a deterministic analytics planner. "
             "You translate user questions about a spreadsheet into a single JSON plan.\n\n"
@@ -310,9 +635,13 @@ class ChatService:
             "4. The JSON must have this shape:\n"
             "   {\n"
             '     "document_id": "...",\n'
-            '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, groupby_count, groupby_sum, select_rows>",\n'
+            '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, '
+            'groupby_count, groupby_sum, groupby_ratio, select_rows>",\n'
             '     "target_column": "<column name or null>",\n'
+            '     "denominator_column": "<for groupby_ratio only; column name or null>",\n'
             '     "group_by": "<column name or null>",\n'
+            '     "time_column": "<date column name or null>",\n'
+            '     "time_grain": "<none | month | year | week>",\n'
             '     "select_columns": ["col1", "col2"] or null,\n'
             '     "filters": [\n'
             '       {"column": "...", "operator": "...", "value": ...}\n'
@@ -328,20 +657,49 @@ class ChatService:
             '              month_equals (value: "YYYY-MM", e.g. "2020-03"),\n'
             '              between_dates (value: ["YYYY-MM-DD", "YYYY-MM-DD"])\n'
             "   - Any:     is_null, is_not_null\n"
-            "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum.\n"
-            "7. group_by is REQUIRED for groupby_count and groupby_sum.\n"
-            "8. select_columns specifies which columns to return for select_rows (null = all columns).\n"
-            "9. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
-            "10. For intents like 'highest/lowest sum/total <metric> by <category>', use groupby_sum "
-            "with target_column=<metric>, group_by=<category>, top_n=1, and order=value_desc (or value_asc for lowest).\n"
-            "11. Column names must be ORIGINAL Excel header names from the list below.\n"
-            "12. document_id must be: " + json.dumps(document_id) + "\n"
-            "13. For select_rows, set limit to the exact number of rows the user asked for "
+            "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_ratio.\n"
+            "7. groupby_ratio: target_column = numerator, denominator_column = denominator, "
+            "group_by = dimension (e.g. profit margin by category → SUM(profit)/SUM(revenue) per category).\n"
+            "8. group_by is REQUIRED for groupby_sum (unless using time_grain alone), groupby_ratio, "
+            "and groupby_count (unless using time_grain without a category).\n"
+            "9. time_grain: use month/year/week with time_column (a date column) for "
+            "monthly sales, seasonality, trends over time. With group_by, you get buckets per period and category.\n"
+            "10. select_columns specifies which columns to return for select_rows (null = all columns).\n"
+            "11. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
+            "12. For 'highest/lowest sum/total <metric> by <dimension>', use groupby_sum with "
+            "target_column=<metric>, group_by=<dimension>, set top_n (e.g. 5 for top 5), order=value_desc or value_asc.\n"
+            "13. Column names must be ORIGINAL Excel header names from the list below.\n"
+            "14. document_id must be: " + json.dumps(document_id) + "\n"
+            "15. For select_rows, set limit to the exact number of rows the user asked for "
             "(e.g. 'first 10', 'top 5', 'show 20 rows', 'limit 15').\n"
-            "14. Never use numbers from filenames, document titles, or labels as limit "
-            "(e.g. '100 Sales Record file' describes the file name, not how many rows to return).\n"
-            "15. If the user does not specify a row count, use limit=50.\n\n"
-            "AVAILABLE COLUMNS:\n" + cols_block
+            "16. Never use numbers from filenames, document titles, or labels as limit.\n"
+            "17. If the user does not specify a row count, use limit=50.\n"
+            "18. Map user phrases to KNOWN CATEGORICAL VALUES (e.g. plural 'fruits' → exact 'Fruits').\n"
+            "19. For Online vs Offline style comparisons, use filters with eq on the channel column, "
+            "or two separate sum/groupby plans are not possible in one JSON — prefer one groupby_sum "
+            "by the channel column to compare.\n"
+            "20. Pure correlation/regression (e.g. does discount increase quantity) is not a single-plan operation; "
+            "use groupby_sum or groupby_count by a categorical discount/channel column when possible.\n"
+            "21. groupby_count counts **rows** (orders/line items/records). Use it only when the user asks "
+            "how many orders, transactions, or records — NOT for 'who buys the most', 'most quantity', "
+            "'total purchased', or 'buys the most <product type>'.\n"
+            "22. For 'which country/region/customer buys or orders the most' (especially with a product or "
+            "category filter), use **groupby_sum** on a quantity/units column if one exists; default to "
+            "revenue/sales only if the question is clearly about money, not physical volume.\n"
+            "23. Apply filters for product type or category (e.g. fruits) with eq/contains on the category "
+            "column; then group_by the geography or customer dimension and order=value_desc, top_n=1 if they "
+            "ask for a single winner.\n"
+            "24. For **which** or **who** plus a superlative (most, highest, best, top, largest, greatest, biggest) "
+            "plus a numeric measure (profit, revenue, sales, quantity, etc.), use **groupby_sum** with "
+            "order=value_desc and top_n=1 (or a small N if they ask for top N) — **not** select_rows. "
+            "Map people-dimension phrases (salesperson, sales person, sales rep, representative, associate, employee) "
+            "to the matching string column from the list below.\n\n"
+            "AVAILABLE COLUMNS:\n"
+            + cols_block
+            + values_block
+            + time_block
+            + numeric_block
+            + measure_pick_hints
         )
 
     async def _generate_analytics_plan(
@@ -362,12 +720,35 @@ class ChatService:
 
         column_names = [c for c in columns if not c.startswith("_")]
         column_types = {c: m.logical_type for c, m in columns.items() if not c.startswith("_")}
-        system_prompt = self._build_analytics_system_prompt(column_names, document_id, column_types)
+        profile = meta.get_profile(document_id, sheet_name)
+        profile_values: dict[str, list[str]] = {}
+        if profile:
+            for col_name, col_prof in profile.columns.items():
+                if col_prof.logical_type == "string" and col_prof.top_values:
+                    profile_values[col_name] = list(col_prof.top_values.keys())
+        time_hint = meta.get_timeseries_time_column(document_id, sheet_name)
+        numeric_hints = _format_analytics_numeric_hints(profile)
+        measure_pick_hints = _format_suggested_measure_picks(column_names, column_types)
+        system_prompt = self._build_analytics_system_prompt(
+            column_names,
+            document_id,
+            column_types,
+            profile_values=profile_values or None,
+            suggested_time_column=time_hint,
+            numeric_hints=numeric_hints,
+            measure_pick_hints=measure_pick_hints,
+        )
 
         try:
             resp = await self._llm.complete(system_prompt, user_query, temperature=0.0)
             plan = self._parse_analytics_plan_json(resp.content)
             plan = apply_select_rows_limit_from_user_query(plan, user_query)
+            plan = _repair_rowcount_plan_to_quantity_sum(
+                plan, user_query, column_names, column_types
+            )
+            plan = _repair_select_rows_to_groupby_superlative(
+                plan, user_query, column_names, column_types
+            )
             return plan
         except (json.JSONDecodeError, ValidationError, Exception) as exc:
             logger.warning("Analytics plan generation/validation failed: %s", exc)

@@ -171,10 +171,19 @@ export function SettingsView() {
                 {/* Request Timeout */}
                 <div className="p-4 bg-gray-50 rounded-lg">
                   <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
-                    Request Timeout
+                    Request Timeout (web / scrape)
                   </label>
                   <p className="mt-1 text-sm text-gray-700">
                     {settings.request_timeout_s}s
+                  </p>
+                </div>
+
+                <div className="p-4 bg-gray-50 rounded-lg">
+                  <label className="text-xs font-medium text-gray-500 uppercase tracking-wide">
+                    LLM Request Timeout
+                  </label>
+                  <p className="mt-1 text-sm text-gray-700">
+                    {settings.llm_request_timeout_s}s
                   </p>
                 </div>
                 

@@ -19,6 +19,7 @@ from backend.analytics.models import (
     AnalyticsFilter,
     AnalyticsPlan,
     ColumnMetadata,
+    ColumnProfile,
     DatasetProfile,
 )
 from backend.analytics.metadata_repository import MetadataRepository
@@ -30,12 +31,16 @@ from backend.analytics.sql_compiler import (
     compile_plan,
     compile_year_equals,
 )
+from backend.analytics.filter_value_normalizer import normalize_analytics_plan_filters
+from backend.analytics.router import AnalyticsRouter
 from backend.analytics.validator import validate_plan, validate_result
 from backend.analytics.errors import AnalyticsPlanValidationError
 from backend.documents import _infer_logical_type, _normalize_cell_value
 from backend.services.chat_service import (
     apply_select_rows_limit_from_user_query,
     infer_select_rows_limit_from_query,
+    _repair_rowcount_plan_to_quantity_sum,
+    _repair_select_rows_to_groupby_superlative,
 )
 
 
@@ -143,6 +148,14 @@ class TestTypeInference:
         s = pd.Series([], dtype=object)
         assert _infer_logical_type(s) == "string"
 
+    def test_currency_strings_infer_as_float(self):
+        s = pd.Series(["$1,234.56", "$2,000.00", "(100.25)", "€500"])
+        assert _infer_logical_type(s) == "float"
+
+    def test_currency_strings_infer_as_integer_when_whole_units(self):
+        s = pd.Series([f"${i:,}" for i in range(1, 11)])
+        assert _infer_logical_type(s) == "integer"
+
 
 # ============================================================================
 # Cell Normalization
@@ -177,6 +190,12 @@ class TestCellNormalization:
         epoch = _normalize_cell_value("2020-06-15", "date")
         expected = int(datetime(2020, 6, 15, tzinfo=timezone.utc).timestamp())
         assert epoch == expected
+
+    def test_currency_string_normalizes_to_float(self):
+        assert _normalize_cell_value("$1,234.50", "float") == pytest.approx(1234.5)
+
+    def test_accounting_negative_parentheses_to_float(self):
+        assert _normalize_cell_value("(99.5)", "float") == pytest.approx(-99.5)
 
 
 # ============================================================================
@@ -740,6 +759,23 @@ def test_format_groupby_count_table():
     assert "| A | 3 |" in md
 
 
+def test_format_groupby_sum_value_no_scientific_notation():
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    ar = AnalyticsResult(
+        summary="Computed group-by sums of 'Profit' by 'SalesChannel' (top 1).",
+        sql="SELECT 1",
+        parameters=[],
+        data={"rows": [{"key": "Online", "value": 34189.2}]},
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, {})
+    assert "| Online | 34,189.2 |" in md
+    assert "e+" not in md.lower()
+
+
 def test_format_select_rows_coerces_sqlite_row_objects():
     """sqlite3.Row is not isinstance(..., dict); formatter must still emit a table."""
     import sqlite3
@@ -765,3 +801,237 @@ def test_format_select_rows_coerces_sqlite_row_objects():
     assert "| Australia |" in md
     assert "9,925" in md
     assert "**Data:**" not in md
+
+
+# ============================================================================
+# Filter normalizer + router + time grain + groupby_ratio
+# ============================================================================
+
+
+def test_normalize_filter_maps_user_phrase_to_profile_value():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE sales (category TEXT, country TEXT, revenue REAL)")
+    conn.executemany(
+        "INSERT INTO sales VALUES (?,?,?)",
+        [("Fruits", "ES", 10.0), ("Fruits", "US", 20.0), ("Veg", "US", 5.0)],
+    )
+    col_meta = {
+        "ProductCategory": ColumnMetadata(
+            "ProductCategory", "string", "TEXT", True, "ProductCategory", "category"
+        ),
+        "Country": ColumnMetadata("Country", "string", "TEXT", True, "Country", "country"),
+        "Revenue": ColumnMetadata("Revenue", "float", "REAL", True, "Revenue", "revenue"),
+    }
+    profile = DatasetProfile(
+        row_count=3,
+        columns={
+            "ProductCategory": ColumnProfile(
+                logical_type="string",
+                null_ratio=0.0,
+                distinct_count=2,
+                top_values={"Fruits": 2, "Veg": 1},
+            ),
+        },
+    )
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_sum",
+        target_column="Revenue",
+        group_by="Country",
+        filters=[
+            AnalyticsFilter(column="ProductCategory", operator="eq", value="fruits"),
+        ],
+    )
+    out = normalize_analytics_plan_filters(
+        plan, col_meta, profile, conn, "sales"
+    )
+    assert out.filters[0].value == "Fruits"
+    validate_plan(out, col_meta)
+    compiled = compile_plan(out, table_name="sales", column_metadata=col_meta)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+    assert len(rows) == 2
+    keys = {r["key"] for r in rows}
+    assert keys == {"ES", "US"}
+
+
+class TestAnalyticsRouterExpanded:
+    def test_monthly_sales_trend_routes(self):
+        r = AnalyticsRouter()
+        d = r.decide("Monthly sales trend by category")
+        assert d.use_analytics is True
+
+    def test_top_profitable_products_routes(self):
+        r = AnalyticsRouter()
+        d = r.decide("Top 5 most profitable products")
+        assert d.use_analytics is True
+
+    def test_online_offline_comparison_routes(self):
+        r = AnalyticsRouter()
+        d = r.decide("Online vs Offline revenue comparison")
+        assert d.use_analytics is True
+
+    def test_generic_most_without_metric_does_not_route_bi_branch(self):
+        r = AnalyticsRouter()
+        d = r.decide("What is the most popular programming language?")
+        assert d.use_analytics is False
+
+    def test_who_has_most_profit_routes(self):
+        r = AnalyticsRouter()
+        d = r.decide("Who has the most profit?")
+        assert d.use_analytics is True
+
+
+def test_repair_select_rows_to_groupby_superlative_salesperson_profit():
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="select_rows",
+        limit=50,
+    )
+    column_names = ["Sales Person", "Profit", "Qty"]
+    column_types = {
+        "Sales Person": "string",
+        "Profit": "float",
+        "Qty": "integer",
+    }
+    q = "which sales person has the most profit overall in sales?"
+    out = _repair_select_rows_to_groupby_superlative(
+        plan, q, column_names, column_types
+    )
+    assert out.operation == "groupby_sum"
+    assert out.target_column == "Profit"
+    assert out.group_by == "Sales Person"
+    assert out.order == "value_desc"
+    assert out.top_n == 1
+
+
+def test_repair_select_rows_unchanged_without_which_who_superlative():
+    plan = AnalyticsPlan(document_id="d1", operation="select_rows", limit=10)
+    column_names = ["Sales Person", "Profit"]
+    column_types = {"Sales Person": "string", "Profit": "float"}
+    out = _repair_select_rows_to_groupby_superlative(
+        plan, "show me the first 10 rows", column_names, column_types
+    )
+    assert out.operation == "select_rows"
+
+
+def test_groupby_ratio_sql():
+    col_meta = {
+        "Cat": ColumnMetadata("Cat", "string", "TEXT", True, "Cat", "c_cat"),
+        "Profit": ColumnMetadata("Profit", "float", "REAL", True, "Profit", "c_profit"),
+        "Revenue": ColumnMetadata("Revenue", "float", "REAL", True, "Revenue", "c_rev"),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_ratio",
+        target_column="Profit",
+        denominator_column="Revenue",
+        group_by="Cat",
+        top_n=10,
+    )
+    validate_plan(plan, col_meta)
+    compiled = compile_plan(plan, table_name="t", column_metadata=col_meta)
+    assert "SUM(c_profit)" in compiled.sql
+    assert "NULLIF(SUM(c_rev)" in compiled.sql
+
+
+def test_groupby_sum_monthly_time_grain():
+    col_meta = {
+        "OrderDate": ColumnMetadata(
+            "OrderDate", "date", "INTEGER", True, "OrderDate", "c_od"
+        ),
+        "Cat": ColumnMetadata("Cat", "string", "TEXT", True, "Cat", "c_cat"),
+        "Amount": ColumnMetadata("Amount", "float", "REAL", True, "Amount", "c_amt"),
+    }
+    t_jan = int(datetime(2024, 1, 10, tzinfo=timezone.utc).timestamp())
+    t_feb = int(datetime(2024, 2, 5, tzinfo=timezone.utc).timestamp())
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (c_od INTEGER, c_cat TEXT, c_amt REAL)")
+    conn.executemany(
+        "INSERT INTO t VALUES (?,?,?)",
+        [(t_jan, "A", 100.0), (t_jan, "B", 50.0), (t_feb, "A", 30.0)],
+    )
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_sum",
+        target_column="Amount",
+        group_by="Cat",
+        time_column="OrderDate",
+        time_grain="month",
+    )
+    validate_plan(plan, col_meta)
+    compiled = compile_plan(plan, table_name="t", column_metadata=col_meta)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+    by_period = {(r["time_bucket"], r["key"]): r["value"] for r in rows}
+    assert by_period[("2024-01", "A")] == pytest.approx(100.0)
+    assert by_period[("2024-01", "B")] == pytest.approx(50.0)
+    assert by_period[("2024-02", "A")] == pytest.approx(30.0)
+
+
+def test_repair_buys_most_from_rowcount_to_quantity_sum():
+    """'Buys the most' must not use groupby_count (row frequency)."""
+    column_types = {
+        "Country": "string",
+        "ProductCategory": "string",
+        "Quantity": "integer",
+        "Revenue": "float",
+    }
+    column_names = list(column_types.keys())
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_count",
+        group_by="Country",
+        filters=[
+            AnalyticsFilter(column="ProductCategory", operator="eq", value="Fruits"),
+        ],
+    )
+    out = _repair_rowcount_plan_to_quantity_sum(
+        plan,
+        "Which country buys the most fruits?",
+        column_names,
+        column_types,
+    )
+    assert out.operation == "groupby_sum"
+    assert out.target_column == "Quantity"
+    assert out.group_by == "Country"
+    assert out.order == "value_desc"
+    assert len(out.filters) == 1
+
+
+def test_repair_skips_how_many_orders():
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_count",
+        group_by="Country",
+    )
+    column_types = {"Country": "string", "Quantity": "integer"}
+    out = _repair_rowcount_plan_to_quantity_sum(
+        plan,
+        "How many orders per country?",
+        list(column_types.keys()),
+        column_types,
+    )
+    assert out.operation == "groupby_count"
+
+
+def test_format_markdown_time_bucket_value_columns():
+    from backend.analytics.display_markdown import format_analytics_result_markdown
+    from backend.analytics.models import AnalyticsResult
+
+    ar = AnalyticsResult(
+        summary="Monthly totals.",
+        sql="SELECT 1",
+        parameters=[],
+        data={
+            "rows": [
+                {"time_bucket": "2024-01", "value": 150.0},
+                {"time_bucket": "2024-02", "value": 30.0},
+            ]
+        },
+        document_id="d1",
+        sheet_name="Sheet1",
+    )
+    md = format_analytics_result_markdown(ar, {})
+    assert "| period | value |" in md
+    assert "2024-01" in md
