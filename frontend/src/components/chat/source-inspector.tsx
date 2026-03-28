@@ -38,7 +38,12 @@ export function SourceInspector({ source, onClose }: SourceInspectorProps) {
       {/* Header */}
       <div className="flex items-center justify-between p-4 border-b border-gray-200">
         <h3 className="font-semibold text-gray-900">Source Details</h3>
-        <Button variant="ghost" size="icon" onClick={onClose}>
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onClose}
+          aria-label="Close source details"
+        >
           <X className="h-4 w-4" />
         </Button>
       </div>

@@ -3,7 +3,6 @@ import {
   Area,
   CartesianGrid,
   ComposedChart,
-  Legend,
   Line,
   ReferenceLine,
   ResponsiveContainer,
@@ -34,6 +33,15 @@ function buildRows(chart: ChartSpec): Row[] {
     }
     const band = s.area_band ?? s.confidence_band;
     if (band) {
+      const lineStart = s.data[0]?.date;
+      const bandStart = band.lower[0]?.date ?? band.upper[0]?.date;
+      if (lineStart && bandStart && lineStart !== bandStart) {
+        const bridgeVal = s.data[0]?.value;
+        if (bridgeVal != null) {
+          ensure(lineStart)[`${s.name}__lower`] = bridgeVal;
+          ensure(lineStart)[`${s.name}__upper`] = bridgeVal;
+        }
+      }
       for (const p of band.lower) {
         ensure(p.date)[`${s.name}__lower`] = p.value;
       }
@@ -44,6 +52,21 @@ function buildRows(chart: ChartSpec): Row[] {
   }
 
   return order.map((x) => byX.get(x)!);
+}
+
+/**
+ * Return the last x that has a Historical value.
+ * The reference line is placed at `position="end"` of this band,
+ * which visually sits on the boundary between historical and forecast.
+ */
+function getLastHistoricalX(rows: Row[]): string | undefined {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const v = rows[i].Historical;
+    if (v === undefined || v === null) continue;
+    const n = typeof v === "number" ? v : Number(v);
+    if (!Number.isNaN(n)) return rows[i].x;
+  }
+  return undefined;
 }
 
 function formatCompact(value: number): string {
@@ -64,11 +87,69 @@ function formatTooltipValue(value: number): string {
 const COLOR_HISTORICAL = "#2563eb";
 const COLOR_FORECAST = "#7c3aed";
 const COLOR_BAND = "#c4b5fd";
+const COLOR_FORECAST_START = "#64748b";
 
 interface CustomTooltipProps {
   active?: boolean;
   payload?: Array<{ name: string; value: number; color: string }>;
   label?: string;
+}
+
+function SeriesLegendRow({
+  chart,
+  forecastStartX,
+}: {
+  chart: ChartSpec;
+  forecastStartX?: string;
+}) {
+  const items = chart.series.filter(
+    (s) => s.data.length > 0 && (s.name === "Historical" || s.name === "Forecast")
+  );
+  if (!items.length && !forecastStartX) return null;
+  return (
+    <div className="flex flex-wrap justify-center gap-x-8 gap-y-1.5 pb-1 text-xs">
+      {items.map((s) => {
+        const dashed = s.style === "dashed" || s.name === "Forecast";
+        const color = s.name === "Historical" ? COLOR_HISTORICAL : COLOR_FORECAST;
+        return (
+          <span key={s.name} className="inline-flex items-center gap-2">
+            <svg width={28} height={10} className="shrink-0" aria-hidden>
+              <line
+                x1={1}
+                y1={5}
+                x2={27}
+                y2={5}
+                stroke={color}
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeDasharray={dashed ? "5 4" : undefined}
+              />
+            </svg>
+            <span style={{ color }}>{s.name}</span>
+          </span>
+        );
+      })}
+      {forecastStartX ? (
+        <span className="inline-flex items-center gap-2">
+          <svg width={28} height={10} className="shrink-0" aria-hidden>
+            <line
+              x1={14}
+              y1={1}
+              x2={14}
+              y2={9}
+              stroke={COLOR_FORECAST_START}
+              strokeWidth={1.75}
+              strokeLinecap="round"
+              strokeDasharray="3 2.5"
+            />
+          </svg>
+          <span style={{ color: COLOR_FORECAST_START }} className="font-medium">
+            Forecast start
+          </span>
+        </span>
+      ) : null}
+    </div>
+  );
 }
 
 function CustomTooltip({ active, payload, label }: CustomTooltipProps) {
@@ -91,6 +172,7 @@ function CustomTooltip({ active, payload, label }: CustomTooltipProps) {
 
 export function ChartView({ chart }: { chart: ChartSpec }) {
   const data = buildRows(chart);
+  const forecastStartX = getLastHistoricalX(data) ?? chart.forecast_start;
   const lines: ReactNode[] = [];
   const areas: ReactNode[] = [];
 
@@ -153,67 +235,62 @@ export function ChartView({ chart }: { chart: ChartSpec }) {
       {chart.subtitle && (
         <p className="text-xs text-gray-500 mb-2">{chart.subtitle}</p>
       )}
-      <div className="h-80 w-full mt-1">
-        <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={data} margin={{ top: 12, right: 16, left: 4, bottom: 24 }}>
-            <defs>
-              <linearGradient id="bandGradient" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stopColor={COLOR_BAND} stopOpacity={0.35} />
-                <stop offset="100%" stopColor={COLOR_BAND} stopOpacity={0.08} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-            <XAxis
-              dataKey="x"
-              tick={{ fontSize: 10 }}
-              angle={-30}
-              textAnchor="end"
-              height={48}
-              label={{
-                value: chart.x_label,
-                position: "insideBottom",
-                offset: -16,
-                style: { fontSize: 11, fill: "#6b7280", fontWeight: 500 },
-              }}
-            />
-            <YAxis
-              tick={{ fontSize: 10 }}
-              width={56}
-              tickFormatter={formatCompact}
-              label={{
-                value: chart.y_label,
-                angle: -90,
-                position: "insideLeft",
-                offset: 8,
-                style: { fontSize: 11, fill: "#6b7280", fontWeight: 500 },
-              }}
-            />
-            <Tooltip content={<CustomTooltip />} />
-            <Legend
-              wrapperStyle={{ fontSize: 12, paddingTop: 4 }}
-              formatter={(value: string) => {
-                if (value === "Historical") return <span style={{ color: COLOR_HISTORICAL }}>Historical</span>;
-                if (value === "Forecast") return <span style={{ color: COLOR_FORECAST }}>Forecast</span>;
-                return value;
-              }}
-            />
-            {chart.forecast_start ? (
-              <ReferenceLine
-                x={chart.forecast_start}
-                stroke="#94a3b8"
-                strokeDasharray="4 4"
+      <SeriesLegendRow chart={chart} forecastStartX={forecastStartX} />
+      <div className="mt-1 flex h-80 w-full flex-col">
+        <div className="min-h-0 min-w-0 flex-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart
+              data={data}
+              margin={{ top: 8, right: 32, left: 4, bottom: 4 }}
+            >
+              <defs>
+                <linearGradient id="bandGradient" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={COLOR_BAND} stopOpacity={0.35} />
+                  <stop offset="100%" stopColor={COLOR_BAND} stopOpacity={0.08} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+              <XAxis
+                dataKey="x"
+                textAnchor="middle"
+                tick={{ fontSize: 10 }}
+                angle={-42}
+                interval="preserveStartEnd"
+                minTickGap={18}
+                height={54}
+                tickMargin={10}
+              />
+              <YAxis
+                tick={{ fontSize: 10 }}
+                width={56}
+                tickFormatter={formatCompact}
                 label={{
-                  value: "Forecast start",
-                  position: "top",
-                  fill: "#64748b",
-                  fontSize: 10,
+                  value: chart.y_label,
+                  angle: -90,
+                  position: "insideLeft",
+                  offset: 8,
+                  style: { fontSize: 11, fill: "#6b7280", fontWeight: 500 },
                 }}
               />
-            ) : null}
-            {areas}
-            {lines}
-          </ComposedChart>
-        </ResponsiveContainer>
+              <Tooltip content={<CustomTooltip />} />
+              {forecastStartX ? (
+                <ReferenceLine
+                  x={forecastStartX}
+                  stroke="#64748b"
+                  strokeDasharray="4 4"
+                  strokeWidth={1.5}
+                  ifOverflow="visible"
+                  position="end"
+                />
+              ) : null}
+              {areas}
+              {lines}
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="shrink-0 pt-1 text-center text-[11px] font-medium leading-tight text-gray-600">
+          {chart.x_label}
+        </p>
       </div>
     </div>
   );

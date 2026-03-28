@@ -1,14 +1,17 @@
-import { ExternalLink, Clock, Copy, Check } from "lucide-react";
+import { ExternalLink, Clock, Copy, Check, ArrowLeft } from "lucide-react";
 import { useState } from "react";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { useArchivePage } from "../../lib/hooks";
 import { formatDate, extractDomain } from "../../lib/utils";
 
 interface ArchiveDetailProps {
   urlHash: string | null;
+  /** When set (e.g. narrow layout), show a back control in the header. */
+  onBack?: () => void;
 }
 
-export function ArchiveDetail({ urlHash }: ArchiveDetailProps) {
+export function ArchiveDetail({ urlHash, onBack }: ArchiveDetailProps) {
   const [copied, setCopied] = useState(false);
   const { data, isLoading, error } = useArchivePage(urlHash || "", !!urlHash);
   
@@ -24,8 +27,8 @@ export function ArchiveDetail({ urlHash }: ArchiveDetailProps) {
   
   if (isLoading) {
     return (
-      <div className="flex-1 flex items-center justify-center p-8">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+      <div className="flex flex-1 items-center justify-center p-8">
+        <Spinner />
       </div>
     );
   }
@@ -53,10 +56,22 @@ export function ArchiveDetail({ urlHash }: ArchiveDetailProps) {
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="p-4 border-b border-gray-200 bg-white">
+      <div className="border-b border-gray-200 bg-white p-4">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <h2 className="text-lg font-semibold text-gray-900 truncate">
+            {onBack && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="-ml-2 mb-2 gap-1 text-gray-600"
+                onClick={onBack}
+              >
+                <ArrowLeft className="h-4 w-4" />
+                Back to list
+              </Button>
+            )}
+            <h2 className="truncate text-lg font-semibold text-gray-900">
               {extractDomain(data.url)}
             </h2>
             <a

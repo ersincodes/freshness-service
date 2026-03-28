@@ -5,8 +5,10 @@
 
 import { useState, useRef, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { FileText, Sheet, File, Upload } from "lucide-react";
 import { Button } from "../ui/button";
 import { Card } from "../ui/card";
+import { Spinner } from "../ui/spinner";
 import { useChat } from "../../store/chat-store.tsx";
 import { cn } from "../../lib/utils";
 import {
@@ -52,15 +54,16 @@ function getStatusColor(status: DocumentStatus): string {
   }
 }
 
-function getDocTypeIcon(docType: string): string {
+function DocTypeIcon({ docType }: { docType: string }) {
+  const className = "h-8 w-8 shrink-0 text-primary-600";
   switch (docType) {
     case "pdf":
-      return "📄";
+      return <FileText className={className} aria-hidden />;
     case "xlsx":
     case "xls":
-      return "📊";
+      return <Sheet className={className} aria-hidden />;
     default:
-      return "📁";
+      return <File className={className} aria-hidden />;
   }
 }
 
@@ -103,7 +106,7 @@ function DocumentItem({
         ) : (
           <span className="w-4 shrink-0" aria-hidden />
         )}
-        <span className="text-2xl">{getDocTypeIcon(document.doc_type)}</span>
+        <DocTypeIcon docType={document.doc_type} />
         <div className="flex-1 min-w-0">
           <p className="font-medium text-gray-900 truncate" title={document.filename}>
             {document.filename}
@@ -195,7 +198,7 @@ function UploadZone({ onUpload, isUploading }: UploadZoneProps) {
     <div
       className={`
         border-2 border-dashed rounded-lg p-8 text-center transition-colors
-        ${isDragging ? "border-blue-500 bg-blue-50" : "border-gray-300 hover:border-gray-400"}
+        ${isDragging ? "border-primary-500 bg-primary-50" : "border-gray-300 hover:border-gray-400"}
         ${isUploading ? "opacity-50 pointer-events-none" : "cursor-pointer"}
       `}
       onDragOver={handleDragOver}
@@ -213,7 +216,7 @@ function UploadZone({ onUpload, isUploading }: UploadZoneProps) {
         disabled={isUploading}
       />
       
-      <div className="text-4xl mb-3">📤</div>
+      <Upload className="mx-auto mb-3 h-12 w-12 text-primary-500" aria-hidden />
       
       {isUploading ? (
         <p className="text-gray-600">Uploading...</p>
@@ -346,7 +349,10 @@ export function DocumentLibrary() {
         </div>
         
         {isLoading ? (
-          <div className="p-8 text-center text-gray-500">Loading documents...</div>
+          <div className="flex flex-col items-center justify-center gap-2 p-8 text-gray-500">
+            <Spinner />
+            <span className="text-sm">Loading documents…</span>
+          </div>
         ) : error ? (
           <div className="p-8 text-center text-red-600">
             Failed to load documents: {(error as Error)?.message || "Unknown error"}

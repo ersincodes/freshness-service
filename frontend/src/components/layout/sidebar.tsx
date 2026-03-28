@@ -13,6 +13,8 @@ interface SidebarProps {
   onSelectConversation: (id: string) => void;
   onNewConversation: () => void;
   onDeleteConversation: (id: string) => void;
+  /** Called after any navigation action (e.g. close mobile drawer). */
+  onNavigate?: () => void;
 }
 
 export function Sidebar({
@@ -23,6 +25,7 @@ export function Sidebar({
   onSelectConversation,
   onNewConversation,
   onDeleteConversation,
+  onNavigate,
 }: SidebarProps) {
   const navItems: { id: View; label: string; icon: typeof MessageSquare }[] = [
     { id: "chat", label: "Chat", icon: MessageSquare },
@@ -46,7 +49,12 @@ export function Sidebar({
           return (
             <button
               key={item.id}
-              onClick={() => onViewChange(item.id)}
+              type="button"
+              onClick={() => {
+                onViewChange(item.id);
+                onNavigate?.();
+              }}
+              aria-current={currentView === item.id ? "page" : undefined}
               className={cn(
                 "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm transition-colors",
                 currentView === item.id
@@ -68,7 +76,10 @@ export function Sidebar({
             <Button
               variant="outline"
               className="w-full justify-start gap-2 bg-transparent border-gray-700 text-gray-300 hover:bg-gray-800 hover:text-white"
-              onClick={onNewConversation}
+              onClick={() => {
+                onNewConversation();
+                onNavigate?.();
+              }}
             >
               <Plus className="h-4 w-4" />
               New Chat
@@ -91,16 +102,21 @@ export function Sidebar({
                         ? "bg-gray-800 text-white"
                         : "text-gray-400 hover:text-white hover:bg-gray-800"
                     )}
-                    onClick={() => onSelectConversation(conv.id)}
+                    onClick={() => {
+                      onSelectConversation(conv.id);
+                      onNavigate?.();
+                    }}
                   >
                     <MessageSquare className="h-4 w-4 flex-shrink-0" />
                     <span className="flex-1 truncate">{conv.title}</span>
                     <button
+                      type="button"
                       onClick={(e) => {
                         e.stopPropagation();
                         onDeleteConversation(conv.id);
                       }}
                       className="opacity-0 group-hover:opacity-100 p-1 hover:bg-gray-700 rounded transition-opacity"
+                      aria-label={`Delete conversation ${conv.title}`}
                     >
                       <Trash2 className="h-3 w-3 text-gray-400 hover:text-red-400" />
                     </button>
