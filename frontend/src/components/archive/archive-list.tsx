@@ -1,8 +1,10 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { Search, ExternalLink, Clock, FileText } from "lucide-react";
 import { Input } from "../ui/input";
 import { Card, CardContent } from "../ui/card";
+import { Spinner } from "../ui/spinner";
 import { useArchiveSearch } from "../../lib/hooks";
+import { useDebouncedValue } from "../../lib/use-debounced-value";
 import { formatDate, extractDomain } from "../../lib/utils";
 import type { ArchiveEntry } from "../../lib/types";
 
@@ -13,23 +15,9 @@ interface ArchiveListProps {
 
 export function ArchiveList({ onSelectEntry, selectedUrlHash }: ArchiveListProps) {
   const [searchQuery, setSearchQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  
+  const debouncedQuery = useDebouncedValue(searchQuery, 300);
+
   const { data, isLoading, error } = useArchiveSearch(debouncedQuery);
-  
-  // Debounce search with useCallback
-  const handleSearchChange = useCallback((value: string) => {
-    const timeoutId = setTimeout(() => {
-      setDebouncedQuery(value);
-    }, 300);
-    return () => clearTimeout(timeoutId);
-  }, []);
-  
-  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const value = e.target.value;
-    setSearchQuery(value);
-    handleSearchChange(value);
-  };
   
   return (
     <div className="flex flex-col h-full">
@@ -41,7 +29,7 @@ export function ArchiveList({ onSelectEntry, selectedUrlHash }: ArchiveListProps
             type="text"
             placeholder="Search archive..."
             value={searchQuery}
-            onChange={handleInputChange}
+            onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-10"
           />
         </div>
@@ -56,7 +44,7 @@ export function ArchiveList({ onSelectEntry, selectedUrlHash }: ArchiveListProps
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {isLoading && (
           <div className="flex items-center justify-center py-8">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+            <Spinner />
           </div>
         )}
         

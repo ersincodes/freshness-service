@@ -1,5 +1,6 @@
 import { RefreshCw, Server, Globe, Database, Cpu, CheckCircle, XCircle, AlertCircle } from "lucide-react";
 import { Button } from "../ui/button";
+import { Spinner } from "../ui/spinner";
 import { Card, CardHeader, CardTitle, CardContent } from "../ui/card";
 import { Badge } from "../ui/badge";
 import { useSettings, useHealth } from "../../lib/hooks";
@@ -64,7 +65,7 @@ export function SettingsView() {
         <CardContent>
           {healthLoading ? (
             <div className="flex items-center justify-center py-8">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+              <Spinner />
             </div>
           ) : health ? (
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
@@ -109,7 +110,7 @@ export function SettingsView() {
         <CardContent>
           {settingsLoading ? (
             <div className="flex items-center justify-center py-8">
-              <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary-600"></div>
+              <Spinner />
             </div>
           ) : settings ? (
             <div className="space-y-4">

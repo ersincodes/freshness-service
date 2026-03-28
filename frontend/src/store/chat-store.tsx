@@ -217,6 +217,7 @@ interface ChatContextValue {
   sendMessage: (content: string, useStreaming?: boolean) => Promise<void>;
   stopStreaming: () => void;
   clearConversation: (id: string) => void;
+  clearError: () => void;
   setPreferredMode: (mode: PreferredChatMode) => void;
   // Document integration
   setIncludeWeb: (include: boolean) => void;
@@ -508,6 +509,10 @@ export function ChatProvider({ children }: ChatProviderProps) {
     dispatch({ type: "CLEAR_CONVERSATION", payload: id });
   }, []);
 
+  const clearError = useCallback(() => {
+    dispatch({ type: "SET_ERROR", payload: null });
+  }, []);
+
   const value: ChatContextValue = {
     state,
     activeConversation,
@@ -517,6 +522,7 @@ export function ChatProvider({ children }: ChatProviderProps) {
     sendMessage,
     stopStreaming,
     clearConversation,
+    clearError,
     setPreferredMode,
     setIncludeWeb,
     setIncludeDocuments,

@@ -74,7 +74,8 @@ export function Composer({
               onClick={onStop}
               variant="destructive"
               size="icon"
-              className="flex-shrink-0 h-[46px] w-[46px] rounded-lg self-stretch"
+              className="h-[46px] w-[46px] shrink-0 self-stretch rounded-lg"
+              aria-label="Stop generating"
             >
               <Square className="h-4 w-4" />
             </Button>
@@ -83,7 +84,8 @@ export function Composer({
               type="submit"
               disabled={!message.trim() || disabled}
               size="icon"
-              className="flex-shrink-0 h-[46px] w-[46px] rounded-lg self-stretch"
+              className="h-[46px] w-[46px] shrink-0 self-stretch rounded-lg"
+              aria-label={disabled ? "Sending disabled" : "Send message"}
             >
               {disabled ? (
                 <Loader2 className="h-4 w-4 animate-spin" />

@@ -47,9 +47,11 @@ def build_forecast_line_chart(payload: ForecastChatPayload) -> dict[str, Any]:
     ]
 
     bridge_point: list[dict[str, str | float]] = []
+    bridge_band: list[dict[str, str | float]] = []
     if historical_data and forecast_data:
         last_hist = historical_data[-1]
         bridge_point = [{"date": str(last_hist["date"]), "value": last_hist["value"]}]
+        bridge_band = [{"date": str(last_hist["date"]), "value": last_hist["value"]}]
 
     freq_label = _freq_label(payload.frequency)
     measure_part = payload.measure
@@ -82,8 +84,8 @@ def build_forecast_line_chart(payload: ForecastChatPayload) -> dict[str, Any]:
                 "style": "dashed",
                 "data": bridge_point + forecast_data,
                 "area_band": {
-                    "lower": lower_data,
-                    "upper": upper_data,
+                    "lower": bridge_band + lower_data,
+                    "upper": bridge_band + upper_data,
                 },
             },
         ],
