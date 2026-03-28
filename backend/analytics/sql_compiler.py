@@ -5,7 +5,6 @@ this module. The LLM never specifies boundary predicates.
 """
 from __future__ import annotations
 
-import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
@@ -18,6 +17,7 @@ from .models import (
     DATE_ONLY_OPS,
     NUMERIC_ONLY_OPS,
     STRING_ONLY_OPS,
+    TimeGrain,
 )
 
 
@@ -162,6 +162,18 @@ def _compile_where(
     return "WHERE " + " AND ".join(clauses), params
 
 
+def _time_bucket_expr(safe_time_col: str, grain: TimeGrain) -> str:
+    """SQLite expression yielding a string period label (dates stored as UTC epoch seconds)."""
+    inner = f"datetime({safe_time_col}, 'unixepoch')"
+    if grain == "month":
+        return f"strftime('%Y-%m', {inner})"
+    if grain == "year":
+        return f"strftime('%Y', {inner})"
+    if grain == "week":
+        return f"strftime('%G-W%V', {inner})"
+    raise AnalyticsCompilationError(f"Unsupported time_grain: {grain!r}")
+
+
 # ------------------------------------------------------------------
 # Plan compilation
 # ------------------------------------------------------------------
@@ -213,6 +225,46 @@ def compile_plan(
 
     if plan.operation == "groupby_count":
         group_col_name = plan.group_by or plan.target_column
+        top_n = max(1, min(plan.top_n, 1000))
+        use_time = plan.time_grain and plan.time_grain != "none"
+        if use_time:
+            if not plan.time_column:
+                raise AnalyticsCompilationError(
+                    "time_column is required when time_grain is set"
+                )
+            tmeta = column_metadata.get(plan.time_column)
+            if not tmeta or tmeta.logical_type != "date":
+                raise AnalyticsCompilationError(
+                    f"time_column '{plan.time_column}' must be a date column"
+                )
+            safe_t = _safe_col(plan.time_column, column_metadata, original_to_safe)
+            tb = _time_bucket_expr(safe_t, plan.time_grain)
+            if group_col_name:
+                safe_col = _safe_col(group_col_name, column_metadata, original_to_safe)
+                order_sql = {
+                    "count_desc": "cnt DESC",
+                    "count_asc": "cnt ASC",
+                    "value_desc": "cnt DESC",
+                    "value_asc": "cnt ASC",
+                    "key_asc": f"{safe_col} ASC",
+                    "key_desc": f"{safe_col} DESC",
+                }[plan.order]
+                sql = (
+                    f"SELECT {tb} AS time_bucket, {safe_col} AS key, COUNT(1) AS cnt "
+                    f"FROM {table_name} {where_sql} "
+                    f"GROUP BY 1, 2 "
+                    f"ORDER BY time_bucket ASC, {order_sql} "
+                    f"LIMIT {top_n};"
+                )
+                return CompiledSql(sql=sql, parameters=params)
+            sql = (
+                f"SELECT {tb} AS time_bucket, COUNT(1) AS cnt "
+                f"FROM {table_name} {where_sql} "
+                f"GROUP BY 1 "
+                f"ORDER BY time_bucket ASC "
+                f"LIMIT {top_n};"
+            )
+            return CompiledSql(sql=sql, parameters=params)
         if not group_col_name:
             raise AnalyticsCompilationError("groupby_count requires group_by or target_column")
         safe_col = _safe_col(group_col_name, column_metadata, original_to_safe)
@@ -222,9 +274,9 @@ def compile_plan(
             "count_asc": "cnt ASC",
             "key_asc": f"{safe_col} ASC",
             "key_desc": f"{safe_col} DESC",
+            "value_desc": "cnt DESC",
+            "value_asc": "cnt ASC",
         }[plan.order]
-
-        top_n = max(1, min(plan.top_n, 1000))
 
         sql = (
             f"SELECT {safe_col} AS key, COUNT(1) AS cnt "
@@ -238,6 +290,48 @@ def compile_plan(
 
     if plan.operation == "groupby_sum":
         _require_target(plan)
+        top_n = max(1, min(plan.top_n, 1000))
+        use_time = plan.time_grain and plan.time_grain != "none"
+        if use_time:
+            if not plan.time_column:
+                raise AnalyticsCompilationError(
+                    "time_column is required when time_grain is set"
+                )
+            tmeta = column_metadata.get(plan.time_column)
+            if not tmeta or tmeta.logical_type != "date":
+                raise AnalyticsCompilationError(
+                    f"time_column '{plan.time_column}' must be a date column"
+                )
+            safe_t = _safe_col(plan.time_column, column_metadata, original_to_safe)
+            tb = _time_bucket_expr(safe_t, plan.time_grain)
+            safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+            if plan.group_by:
+                safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+                order_sql = {
+                    "value_desc": "value DESC",
+                    "value_asc": "value ASC",
+                    "count_desc": "value DESC",
+                    "count_asc": "value ASC",
+                    "key_asc": f"{safe_group_col} ASC",
+                    "key_desc": f"{safe_group_col} DESC",
+                }[plan.order]
+                sql = (
+                    f"SELECT {tb} AS time_bucket, {safe_group_col} AS key, "
+                    f"SUM({safe_target_col}) AS value "
+                    f"FROM {table_name} {where_sql} "
+                    f"GROUP BY 1, 2 "
+                    f"ORDER BY time_bucket ASC, {order_sql} "
+                    f"LIMIT {top_n};"
+                )
+                return CompiledSql(sql=sql, parameters=params)
+            sql = (
+                f"SELECT {tb} AS time_bucket, SUM({safe_target_col}) AS value "
+                f"FROM {table_name} {where_sql} "
+                f"GROUP BY 1 "
+                f"ORDER BY time_bucket ASC "
+                f"LIMIT {top_n};"
+            )
+            return CompiledSql(sql=sql, parameters=params)
         if not plan.group_by:
             raise AnalyticsCompilationError("groupby_sum requires group_by")
 
@@ -254,12 +348,40 @@ def compile_plan(
             "key_desc": f"{safe_group_col} DESC",
         }[plan.order]
 
-        top_n = max(1, min(plan.top_n, 1000))
-
         sql = (
             f"SELECT {safe_group_col} AS key, SUM({safe_target_col}) AS value "
             f"FROM {table_name} "
             f"{where_sql} "
+            f"GROUP BY {safe_group_col} "
+            f"ORDER BY {order_sql} "
+            f"LIMIT {top_n};"
+        )
+        return CompiledSql(sql=sql, parameters=params)
+
+    if plan.operation == "groupby_ratio":
+        _require_target(plan)
+        if not plan.group_by:
+            raise AnalyticsCompilationError("groupby_ratio requires group_by")
+        if not plan.denominator_column:
+            raise AnalyticsCompilationError("groupby_ratio requires denominator_column")
+        safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+        safe_num = _safe_col(plan.target_column, column_metadata, original_to_safe)
+        safe_den = _safe_col(plan.denominator_column, column_metadata, original_to_safe)
+
+        order_sql = {
+            "value_desc": "value DESC",
+            "value_asc": "value ASC",
+            "count_desc": "value DESC",
+            "count_asc": "value ASC",
+            "key_asc": f"{safe_group_col} ASC",
+            "key_desc": f"{safe_group_col} DESC",
+        }[plan.order]
+
+        top_n = max(1, min(plan.top_n, 1000))
+        sql = (
+            f"SELECT {safe_group_col} AS key, "
+            f"CAST(SUM({safe_num}) AS REAL) / NULLIF(SUM({safe_den}), 0) AS value "
+            f"FROM {table_name} {where_sql} "
             f"GROUP BY {safe_group_col} "
             f"ORDER BY {order_sql} "
             f"LIMIT {top_n};"

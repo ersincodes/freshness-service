@@ -306,3 +306,21 @@ class MetadataRepository:
 
     def resolve_default_sheet_name(self, document_id: str) -> str | None:
         return self._resolve_default_sheet(document_id)
+
+    def get_timeseries_time_column(
+        self, document_id: str, sheet_name: str | None
+    ) -> str | None:
+        """Best-effort date column from ingest-time timeseries detection (for planner hints)."""
+        if sheet_name is None:
+            sheet_name = self._resolve_default_sheet(document_id)
+        if sheet_name is None:
+            return None
+        cur = self._conn.execute(
+            "SELECT time_column FROM timeseries_meta "
+            "WHERE document_id = ? AND sheet_name = ? LIMIT 1;",
+            (document_id, sheet_name),
+        )
+        row = cur.fetchone()
+        if row is None or row[0] is None:
+            return None
+        return str(row[0])

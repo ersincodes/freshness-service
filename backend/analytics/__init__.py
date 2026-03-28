@@ -18,6 +18,7 @@ from .models import (
     AggregationOperation,
     FilterOperator,
     SQLITE_TYPE_MAP,
+    TimeGrain,
 )
 from .router import AnalyticsRouter, AnalyticsRoutingDecision
 from .executor import AnalyticsExecutor
@@ -42,6 +43,7 @@ __all__ = [
     "AggregationOperation",
     "FilterOperator",
     "SQLITE_TYPE_MAP",
+    "TimeGrain",
     "AnalyticsRouter",
     "AnalyticsRoutingDecision",
     "AnalyticsExecutor",

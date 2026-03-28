@@ -131,6 +131,7 @@ class SettingsResponse(BaseModel):
     offline_retrieval_mode: Literal["keyword", "semantic"]
     max_search_results: int
     request_timeout_s: int
+    llm_request_timeout_s: int
     max_chars_per_source: int
     semantic_top_k: int
     # Decoupled RAG settings
@@ -158,6 +159,7 @@ class HealthResponse(BaseModel):
 class ConfigUpdate(BaseModel):
     max_search_results: int | None = Field(None, ge=1)
     request_timeout_s: int | None = Field(None, ge=1)
+    llm_request_timeout_s: int | None = Field(None, ge=15)
     max_chars_per_source: int | None = Field(None, ge=100)
     offline_retrieval_mode: Literal["keyword", "semantic"] | None = None
     semantic_top_k: int | None = Field(None, ge=1)
@@ -214,7 +216,7 @@ def _chat_service() -> ChatService:
     s = get_settings()
     return ChatService(
         s,
-        LLMClient(s.lm_studio_base_url, s.model_name, s.request_timeout_s),
+        LLMClient(s.lm_studio_base_url, s.model_name, s.llm_request_timeout_s),
         BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results),
         _archive_repo(),
         _doc_repo(),
@@ -224,8 +226,10 @@ def _chat_service() -> ChatService:
 
 def _health_service() -> HealthService:
     s = get_settings()
-    return HealthService(LLMClient(s.lm_studio_base_url, s.model_name, s.request_timeout_s),
-                         BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results))
+    return HealthService(
+        LLMClient(s.lm_studio_base_url, s.model_name, s.llm_request_timeout_s),
+        BraveClient(s.brave_api_key, s.request_timeout_s, s.max_search_results),
+    )
 
 
 def _source_to_model(d: dict) -> Source:
@@ -564,6 +568,7 @@ async def get_api_settings() -> SettingsResponse:
         offline_retrieval_mode=s.offline_retrieval_mode,
         max_search_results=s.max_search_results,
         request_timeout_s=s.request_timeout_s,
+        llm_request_timeout_s=s.llm_request_timeout_s,
         max_chars_per_source=s.max_chars_per_source,
         semantic_top_k=s.semantic_top_k,
         web_top_k=s.web_top_k,
@@ -589,6 +594,7 @@ async def update_config(payload: ConfigUpdate) -> dict:
             "offline_retrieval_mode": u.offline_retrieval_mode,
             "semantic_top_k": u.semantic_top_k,
             "request_timeout_s": u.request_timeout_s,
+            "llm_request_timeout_s": u.llm_request_timeout_s,
             "max_chars_per_source": u.max_chars_per_source,
             "brave_api_key_set": bool(u.brave_api_key),
             "web_top_k": u.web_top_k,

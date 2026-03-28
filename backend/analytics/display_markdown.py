@@ -89,8 +89,8 @@ def _format_scalar_for_cell(
     if isinstance(value, float):
         if value.is_integer():
             return f"{int(value):,}"
-        s = f"{value:,.4g}"
-        return s
+        s = f"{value:,.4f}".rstrip("0").rstrip(".")
+        return s if s else "0"
     if isinstance(value, int):
         return f"{value:,}"
     return str(value)
@@ -164,6 +164,56 @@ def format_analytics_result_markdown(
             for r in rows_norm:
                 table_rows.append(
                     [
+                        _format_scalar_for_cell("key", r.get("key"), None),
+                        _format_scalar_for_cell("value", r.get("value"), None),
+                    ]
+                )
+            return f"{summary}\n\n{_markdown_table(headers, table_rows)}"
+
+        if keys == {"time_bucket", "count"}:
+            headers = ["period", "count"]
+            table_rows = []
+            for r in rows_norm:
+                table_rows.append(
+                    [
+                        _format_scalar_for_cell("time_bucket", r.get("time_bucket"), None),
+                        str(int(r.get("count", 0))),
+                    ]
+                )
+            return f"{summary}\n\n{_markdown_table(headers, table_rows)}"
+
+        if keys == {"time_bucket", "value"}:
+            headers = ["period", "value"]
+            table_rows = []
+            for r in rows_norm:
+                table_rows.append(
+                    [
+                        _format_scalar_for_cell("time_bucket", r.get("time_bucket"), None),
+                        _format_scalar_for_cell("value", r.get("value"), None),
+                    ]
+                )
+            return f"{summary}\n\n{_markdown_table(headers, table_rows)}"
+
+        if keys == {"time_bucket", "key", "count"}:
+            headers = ["period", "key", "count"]
+            table_rows = []
+            for r in rows_norm:
+                table_rows.append(
+                    [
+                        _format_scalar_for_cell("time_bucket", r.get("time_bucket"), None),
+                        _format_scalar_for_cell("key", r.get("key"), None),
+                        str(int(r.get("count", 0))),
+                    ]
+                )
+            return f"{summary}\n\n{_markdown_table(headers, table_rows)}"
+
+        if keys == {"time_bucket", "key", "value"}:
+            headers = ["period", "key", "value"]
+            table_rows = []
+            for r in rows_norm:
+                table_rows.append(
+                    [
+                        _format_scalar_for_cell("time_bucket", r.get("time_bucket"), None),
                         _format_scalar_for_cell("key", r.get("key"), None),
                         _format_scalar_for_cell("value", r.get("value"), None),
                     ]

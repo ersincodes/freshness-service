@@ -218,6 +218,7 @@ export interface SettingsResponse {
   offline_retrieval_mode: OfflineRetrievalMode;
   max_search_results: number;
   request_timeout_s: number;
+  llm_request_timeout_s: number;
   max_chars_per_source: number;
   semantic_top_k: number;
 }

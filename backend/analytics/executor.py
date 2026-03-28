@@ -9,6 +9,7 @@ from .errors import (
     AnalyticsPlanValidationError,
     AnalyticsRoutingError,
 )
+from .filter_value_normalizer import normalize_analytics_plan_filters
 from .forecast_repository import ForecastRepository
 from .metadata_repository import MetadataRepository
 from .models import AnalyticsPlan, AnalyticsResult, DatasetProfile
@@ -46,6 +47,15 @@ class AnalyticsExecutor:
         column_metadata = self._meta.get_columns(document_id, sheet_name)
         if not column_metadata:
             raise AnalyticsRoutingError("No column metadata registered for document_id + sheet")
+
+        profile = self._meta.get_profile(document_id, sheet_name)
+        plan = normalize_analytics_plan_filters(
+            plan,
+            column_metadata,
+            profile,
+            self._meta._conn,
+            table_name,
+        )
 
         validate_plan(plan, column_metadata)
 
@@ -102,11 +112,42 @@ class AnalyticsExecutor:
             return {"max": val}
 
         if plan.operation == "groupby_count":
-            out_rows = [{"key": r["key"], "count": int(r["cnt"])} for r in rows]
+            out_rows: list[dict] = []
+            for r in rows:
+                d = dict(r)
+                if "time_bucket" in d and "key" in d:
+                    out_rows.append(
+                        {
+                            "time_bucket": d["time_bucket"],
+                            "key": d["key"],
+                            "count": int(d["cnt"]),
+                        }
+                    )
+                elif "time_bucket" in d:
+                    out_rows.append(
+                        {
+                            "time_bucket": d["time_bucket"],
+                            "count": int(d["cnt"]),
+                        }
+                    )
+                else:
+                    out_rows.append({"key": d["key"], "count": int(d["cnt"])})
             return {"rows": out_rows}
 
-        if plan.operation == "groupby_sum":
-            out_rows = [{"key": r["key"], "value": r["value"] if r["value"] is not None else 0} for r in rows]
+        if plan.operation in ("groupby_sum", "groupby_ratio"):
+            out_rows = []
+            for r in rows:
+                d = dict(r)
+                v = d["value"]
+                val = 0 if v is None else v
+                if "time_bucket" in d and "key" in d:
+                    out_rows.append(
+                        {"time_bucket": d["time_bucket"], "key": d["key"], "value": val}
+                    )
+                elif "time_bucket" in d:
+                    out_rows.append({"time_bucket": d["time_bucket"], "value": val})
+                else:
+                    out_rows.append({"key": d["key"], "value": val})
             return {"rows": out_rows}
 
         if plan.operation == "select_rows":
@@ -132,12 +173,28 @@ class AnalyticsExecutor:
         if op == "max":
             return f"Maximum of '{plan.target_column}' is {data['max']}."
         if op == "groupby_count":
+            if plan.time_grain and plan.time_grain != "none":
+                g = plan.group_by or plan.target_column or "(time only)"
+                return (
+                    f"Computed row counts by {plan.time_grain} and '{g}' (top {plan.top_n})."
+                )
             col = plan.group_by or plan.target_column
             return f"Computed group-by counts for '{col}' (top {plan.top_n})."
         if op == "groupby_sum":
+            if plan.time_grain and plan.time_grain != "none":
+                g = plan.group_by or "(time only)"
+                return (
+                    f"Computed sums of '{plan.target_column}' over {plan.time_grain} "
+                    f"buckets by '{g}' (top {plan.top_n})."
+                )
             return (
                 f"Computed group-by sums of '{plan.target_column}' by "
                 f"'{plan.group_by}' (top {plan.top_n})."
+            )
+        if op == "groupby_ratio":
+            return (
+                f"Computed ratio SUM({plan.target_column})/SUM({plan.denominator_column}) "
+                f"by '{plan.group_by}' (top {plan.top_n})."
             )
         if op == "select_rows":
             return f"Retrieved {data['row_count']} matching row(s)."

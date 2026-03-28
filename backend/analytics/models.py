@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field, model_validator
 
 LogicalType = Literal["string", "integer", "float", "date", "boolean"]
 
+TimeGrain = Literal["none", "month", "year", "week"]
+
 AnalyticsOperation = Literal[
     "count_rows",
     "count_distinct",
@@ -17,6 +19,7 @@ AnalyticsOperation = Literal[
     "max",
     "groupby_count",
     "groupby_sum",
+    "groupby_ratio",
     "select_rows",
 ]
 
@@ -78,6 +81,9 @@ class AnalyticsPlan(BaseModel):
     top_n: int = 50
     select_columns: list[str] | None = None
     limit: int = 50
+    denominator_column: str | None = None
+    time_column: str | None = None
+    time_grain: TimeGrain = "none"
 
     @model_validator(mode="before")
     @classmethod
@@ -92,6 +98,8 @@ class AnalyticsPlan(BaseModel):
                 values["limit"] = 50
             if values.get("filters") is None:
                 values["filters"] = []
+            if values.get("time_grain") is None:
+                values["time_grain"] = "none"
         return values
 
 
