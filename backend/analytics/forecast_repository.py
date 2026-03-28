@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-PIPELINE_VERSION_FORECAST = "forecast_linear_v1"
+PIPELINE_VERSION_FORECAST = "forecast_linear_v2"
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,26 @@ class ForecastRepository:
                 ),
             )
         return fid
+
+    def delete_for_document(self, document_id: str) -> int:
+        """Remove all forecast artifacts for a document. Returns rows deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM forecast_artifacts WHERE document_id = ?;",
+                (document_id,),
+            )
+        return cur.rowcount
+
+    def list_outdated_document_ids(
+        self, current_version: str = PIPELINE_VERSION_FORECAST
+    ) -> list[str]:
+        """Return document_ids that have artifacts from an older pipeline version."""
+        cur = self._conn.execute(
+            "SELECT DISTINCT document_id FROM forecast_artifacts "
+            "WHERE pipeline_version != ?;",
+            (current_version,),
+        )
+        return [str(r[0]) for r in cur.fetchall()]
 
     def list_for_documents(
         self, document_ids: list[str]
