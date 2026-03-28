@@ -299,7 +299,8 @@ def _cleanup_orphaned_analytics(conn: sqlite3.Connection) -> None:
 
 
 def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
-    """Ingest any existing Excel documents that are missing from analytics tables.
+    """Ingest any existing Excel documents that are missing from analytics tables,
+    and re-forecast documents whose artifacts use an outdated pipeline version.
 
     File naming convention: uploads/{document_id}_{filename}
     """
@@ -342,7 +343,47 @@ def _retroactive_analytics_ingestion(db_path: str, upload_dir: str) -> None:
     if ingested_count:
         logger.info("Retroactive analytics ingestion complete: %d document(s)", ingested_count)
 
+    _upgrade_outdated_forecasts(conn, doc_repo, upload_dir)
+
     conn.close()
+
+
+def _upgrade_outdated_forecasts(
+    conn: sqlite3.Connection,
+    doc_repo: DocumentRepository,
+    upload_dir: str,
+) -> None:
+    """Re-forecast documents that still have v1 (or older) pipeline artifacts."""
+    from .analytics.forecast_repository import ForecastRepository, PIPELINE_VERSION_FORECAST
+
+    fc_repo = ForecastRepository(conn)
+    outdated_ids = fc_repo.list_outdated_document_ids(PIPELINE_VERSION_FORECAST)
+    if not outdated_ids:
+        return
+
+    logger.info("Found %d document(s) with outdated forecast artifacts, re-forecasting...", len(outdated_ids))
+    upgraded = 0
+    for doc_id in outdated_ids:
+        info = doc_repo.get_document(doc_id)
+        if info is None:
+            continue
+        file_path = os.path.join(upload_dir, f"{doc_id}_{info.filename}")
+        if not os.path.isfile(file_path):
+            continue
+        try:
+            fc_repo.delete_for_document(doc_id)
+            ingest_excel_to_sqlite(
+                excel_path=file_path,
+                document_id=doc_id,
+                sqlite_connection=conn,
+            )
+            upgraded += 1
+            logger.info("Re-forecasted document %s (%s)", doc_id, info.filename)
+        except Exception as exc:
+            logger.warning("Re-forecast failed for %s: %s", doc_id, exc)
+
+    if upgraded:
+        logger.info("Forecast upgrade complete: %d document(s)", upgraded)
 
 
 @app.on_event("startup")

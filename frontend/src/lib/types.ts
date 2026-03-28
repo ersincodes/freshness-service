@@ -98,15 +98,22 @@ export interface ChartSeriesSpec {
   style: "solid" | "dashed";
   data: ChartDataPoint[];
   confidence_band?: ChartSeriesConfidence;
+  area_band?: ChartSeriesConfidence;
 }
 
 export interface ChartSpec {
   type: "line_chart" | "bar_chart";
   title: string;
+  subtitle?: string;
   x_label: string;
   y_label: string;
   series: ChartSeriesSpec[];
   forecast_start?: string;
+}
+
+export interface HistoricalPoint {
+  date: string;
+  value: number;
 }
 
 export interface ForecastPayload {
@@ -120,6 +127,10 @@ export interface ForecastPayload {
   lower: number[];
   upper: number[];
   model: string;
+  frequency?: string;
+  historical?: HistoricalPoint[];
+  forecast_dates?: string[];
+  filter_label?: string | null;
 }
 
 export interface ChatStreamMetaEvent {

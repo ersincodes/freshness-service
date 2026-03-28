@@ -144,6 +144,34 @@ class ForecastUnavailable:
 
 
 @dataclass(frozen=True)
+class HistoricalPoint:
+    date: str
+    value: float
+
+
+class ForecastPlan(BaseModel):
+    """LLM-generated plan for on-demand filtered forecasting."""
+
+    document_id: str
+    sheet_name: str | None = None
+    measure_column: str
+    time_column: str | None = None
+    filters: list[AnalyticsFilter] = Field(default_factory=list)
+    horizon: int = 3
+    filter_label: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_nulls(cls, values: dict) -> dict:
+        if isinstance(values, dict):
+            if values.get("horizon") is None:
+                values["horizon"] = 3
+            if values.get("filters") is None:
+                values["filters"] = []
+        return values
+
+
+@dataclass(frozen=True)
 class ForecastChatPayload:
     """Structured forecast for API / SSE responses."""
 
@@ -157,3 +185,7 @@ class ForecastChatPayload:
     lower: list[float]
     upper: list[float]
     model: str
+    frequency: str = "unknown"
+    historical: list[HistoricalPoint] = field(default_factory=list)
+    forecast_dates: list[str] = field(default_factory=list)
+    filter_label: str | None = None

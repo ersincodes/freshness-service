@@ -20,16 +20,23 @@ from ..analytics.chart_builder import build_forecast_line_chart
 from ..analytics.errors import AnalyticsError
 from ..analytics.display_markdown import format_analytics_result_markdown
 from ..analytics.executor import AnalyticsExecutor
+from ..analytics.forecaster import compute_filtered_forecast
 from ..analytics.metadata_repository import MetadataRepository
 from ..analytics.models import (
     AnalyticsPlan,
     AnalyticsResult,
     AnalyticsUnavailable,
+    DatasetProfile,
     ForecastChatPayload,
+    ForecastPlan,
     ForecastUnavailable,
 )
 from ..analytics.planner import effective_analytics_document_ids
-from ..analytics.predictive import is_predictive_intent, resolve_forecast_for_chat
+from ..analytics.predictive import (
+    is_predictive_intent,
+    query_has_filter_intent,
+    resolve_forecast_for_chat,
+)
 from ..analytics.router import AnalyticsRouter
 from ..config import Settings
 from ..domain import SourceContext, build_context_string, build_location_string, determine_retrieval_type, context_to_source_dict, DOC_URL_PREFIX, FALLBACK_SOURCE_URL, ErrorCode
@@ -366,6 +373,166 @@ class ChatService:
             logger.warning("Analytics plan generation/validation failed: %s", exc)
             return None
 
+    # ------------------------------------------------------------------
+    # Forecast planner (on-demand filtered forecasting)
+    # ------------------------------------------------------------------
+
+    def _build_forecast_system_prompt(
+        self,
+        column_names: list[str],
+        column_types: dict[str, str],
+        document_id: str,
+        profile_values: dict[str, list[str]],
+    ) -> str:
+        cols_block = "\n".join(
+            f"  - {c} (type: {column_types.get(c, 'string')})" for c in column_names
+        )
+        values_block = ""
+        if profile_values:
+            parts = []
+            for col, vals in profile_values.items():
+                parts.append(f"  - {col}: {', '.join(vals)}")
+            values_block = (
+                "\n\nKNOWN CATEGORICAL VALUES:\n" + "\n".join(parts)
+            )
+
+        return (
+            "You are a forecast planner. The user wants a time-series forecast "
+            "from a spreadsheet. Translate their question into a single JSON plan.\n\n"
+            "STRICT RULES:\n"
+            "1. Output ONLY valid JSON — no markdown fences, no commentary.\n"
+            "2. The JSON must have this shape:\n"
+            "   {\n"
+            '     "document_id": "...",\n'
+            '     "measure_column": "<numeric column to forecast>",\n'
+            '     "filters": [\n'
+            '       {"column": "...", "operator": "...", "value": ...}\n'
+            "     ],\n"
+            '     "horizon": 3,\n'
+            '     "filter_label": "<human-readable label for the filter, e.g. Fruits>"\n'
+            "   }\n"
+            "3. measure_column must be a numeric column (integer or float type).\n"
+            "4. If the user mentions a specific category, product, region, segment, etc., "
+            "add a filter with operator 'eq' matching the exact known value.\n"
+            "5. If no filter is needed (user asks about all data), set filters to [].\n"
+            "6. filter_label should be a short human-readable description of the applied "
+            "filters (e.g. 'Fruits', 'Europe - Online'). Set to null if no filters.\n"
+            "7. Allowed filter operators: eq, neq, contains, startswith\n"
+            "8. horizon is the number of future periods to forecast (default 3).\n"
+            "9. Column names must be ORIGINAL Excel header names from the list below.\n"
+            "10. Use the KNOWN CATEGORICAL VALUES to match user terms to exact column values. "
+            "For example, if the user says 'fruit', match it to 'Fruits' in ProductCategory.\n"
+            "11. document_id must be: " + json.dumps(document_id) + "\n\n"
+            "AVAILABLE COLUMNS:\n" + cols_block + values_block
+        )
+
+    async def _generate_forecast_plan(
+        self, *, user_query: str, document_id: str
+    ) -> ForecastPlan | None:
+        if self._analytics_executor is None:
+            return None
+
+        meta = self._analytics_executor.metadata_repo
+        sheet_name = meta.resolve_default_sheet_name(document_id)
+        if sheet_name is None:
+            return None
+
+        columns = meta.get_columns(document_id, sheet_name)
+        if not columns:
+            return None
+
+        column_names = [c for c in columns if not c.startswith("_")]
+        column_types = {
+            c: m.logical_type for c, m in columns.items() if not c.startswith("_")
+        }
+
+        profile = meta.get_profile(document_id, sheet_name)
+        profile_values: dict[str, list[str]] = {}
+        if profile:
+            for col_name, col_prof in profile.columns.items():
+                if col_prof.logical_type == "string" and col_prof.top_values:
+                    profile_values[col_name] = list(col_prof.top_values.keys())
+
+        system_prompt = self._build_forecast_system_prompt(
+            column_names, column_types, document_id, profile_values
+        )
+
+        try:
+            resp = await self._llm.complete(system_prompt, user_query, temperature=0.0)
+            raw = resp.content.strip()
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                start, end = raw.find("{"), raw.rfind("}")
+                if start != -1 and end > start:
+                    obj = json.loads(raw[start : end + 1])
+                else:
+                    raise
+            return ForecastPlan.model_validate(obj)
+        except (json.JSONDecodeError, ValidationError, Exception) as exc:
+            logger.warning("Forecast plan generation failed: %s", exc)
+            return None
+
+    async def _try_on_demand_forecast(
+        self,
+        query: str,
+        document_ids: list[str],
+    ) -> ForecastChatPayload | None:
+        """Attempt on-demand filtered forecast for queries with category intent."""
+        if self._analytics_executor is None:
+            return None
+
+        meta = self._analytics_executor.metadata_repo
+        resolved = effective_analytics_document_ids(meta, document_ids)
+        if not isinstance(resolved, list) or not resolved:
+            return None
+
+        for doc_id in resolved:
+            plan = await self._generate_forecast_plan(
+                user_query=query, document_id=doc_id
+            )
+            if plan is None:
+                continue
+
+            sheet_name = (
+                plan.sheet_name
+                or meta.resolve_default_sheet_name(doc_id)
+            )
+            if sheet_name is None:
+                continue
+
+            table_name = meta.get_table_name(doc_id, sheet_name)
+            if table_name is None:
+                continue
+
+            columns = meta.get_columns(doc_id, sheet_name)
+            if not columns:
+                continue
+
+            filename: str | None = None
+            info = self._docs.get_document(doc_id)
+            if info:
+                filename = info.filename
+
+            try:
+                payload = await asyncio.to_thread(
+                    compute_filtered_forecast,
+                    self._analytics_executor.metadata_repo._conn,
+                    table_name,
+                    columns,
+                    plan,
+                    filename=filename,
+                    sheet_name=sheet_name,
+                )
+                return payload
+            except Exception as exc:
+                logger.warning(
+                    "On-demand forecast failed for %s: %s", doc_id, exc
+                )
+                continue
+
+        return None
+
     async def _try_analytics(
         self, query: str, doc_ids: list[str] | None
     ) -> AnalyticsResult | AnalyticsUnavailable | None:
@@ -693,6 +860,42 @@ class ChatService:
             f"Always cite the source for factual claims.\n{sec}{doc_table}\nCONTEXT:\n{build_context_string(contexts)}"
         )
     
+    def _build_forecast_chat_result(
+        self, fc_res: ForecastChatPayload
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Shared helper: build (payload_dict, chart_spec, source_payload) from a ForecastChatPayload."""
+        chart_spec = build_forecast_line_chart(fc_res)
+        payload_dict = dataclasses.asdict(fc_res)
+        source_payload = self._forecast_source_payload(fc_res)
+        return payload_dict, chart_spec, source_payload
+
+    async def _forecast_narration(
+        self, payload_json: str, query: str
+    ) -> str:
+        narr = await self._llm.complete(
+            "You are a helpful analyst. In 2–4 sentences, summarize the baseline "
+            "linear-trend forecast below for the user. Note that intervals are "
+            "approximate (residual std × 1.96).",
+            f"Forecast:\n{payload_json}\n\nUser question: {query}",
+        )
+        return (narr.content or "").strip()
+
+    def _get_profile_for_documents(
+        self, document_ids: list[str]
+    ) -> tuple[str | None, DatasetProfile | None]:
+        """Return (doc_id, profile) for the first document that has a profile."""
+        if self._analytics_executor is None:
+            return None, None
+        meta = self._analytics_executor.metadata_repo
+        for doc_id in document_ids:
+            sheet = meta.resolve_default_sheet_name(doc_id)
+            if sheet is None:
+                continue
+            profile = meta.get_profile(doc_id, sheet)
+            if profile is not None:
+                return doc_id, profile
+        return None, None
+
     async def get_answer(self, query: str, prefer_mode: str | None = None, include_web: bool = True, include_documents: bool = False, document_ids: list[str] | None = None) -> ChatResult:
         doc_scope = document_ids if document_ids else None
         analytics_prefix = ""
@@ -702,27 +905,35 @@ class ChatService:
             and self._can_use_analytics()
             and is_predictive_intent(query)
         ):
-            rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
-                document_ids
-            )
+            _, profile = self._get_profile_for_documents(document_ids)
+            use_on_demand = query_has_filter_intent(query, profile)
 
-            def _doc_filename(did: str) -> str | None:
-                info = self._docs.get_document(did)
-                return info.filename if info else None
+            fc_res: ForecastChatPayload | ForecastUnavailable | None = None
 
-            fc_res = resolve_forecast_for_chat(rows, get_filename=_doc_filename)
+            if use_on_demand:
+                od_result = await self._try_on_demand_forecast(query, document_ids)
+                if od_result is not None:
+                    fc_res = od_result
+
+            if fc_res is None and not use_on_demand:
+                rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
+                    document_ids
+                )
+
+                def _doc_filename(did: str) -> str | None:
+                    info = self._docs.get_document(did)
+                    return info.filename if info else None
+
+                fc_res = resolve_forecast_for_chat(
+                    rows, get_filename=_doc_filename, user_query=query
+                )
+
             if isinstance(fc_res, ForecastChatPayload):
-                chart_spec = build_forecast_line_chart(fc_res)
-                payload_json = json.dumps(
-                    dataclasses.asdict(fc_res), indent=2, sort_keys=True
+                payload_dict, chart_spec, source_payload = (
+                    self._build_forecast_chat_result(fc_res)
                 )
-                narr = await self._llm.complete(
-                    "You are a helpful analyst. In 2–4 sentences, summarize the baseline "
-                    "linear-trend forecast below for the user. Note that intervals are "
-                    "approximate (residual std × 1.96).",
-                    f"Forecast:\n{payload_json}\n\nUser question: {query}",
-                )
-                body = (narr.content or "").strip()
+                payload_json = json.dumps(payload_dict, indent=2, sort_keys=True)
+                body = await self._forecast_narration(payload_json, query)
                 answer = (
                     f"{body}\n\n**Forecast (baseline)**\n```json\n{payload_json}\n```\n"
                 )
@@ -730,8 +941,8 @@ class ChatService:
                     answer=answer,
                     mode="OFFLINE_ARCHIVE",
                     contexts=[],
-                    attached_sources=[self._forecast_source_payload(fc_res)],
-                    forecast=dataclasses.asdict(fc_res),
+                    attached_sources=[source_payload],
+                    forecast=payload_dict,
                     chart=chart_spec,
                 )
             if isinstance(fc_res, ForecastUnavailable):
@@ -797,38 +1008,45 @@ class ChatService:
                 and self._can_use_analytics()
                 and is_predictive_intent(query)
             ):
-                rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
-                    document_ids
-                )
+                _, profile = self._get_profile_for_documents(document_ids)
+                use_on_demand = query_has_filter_intent(query, profile)
 
-                def _fn(did: str) -> str | None:
-                    info = self._docs.get_document(did)
-                    return info.filename if info else None
+                fc_res: ForecastChatPayload | ForecastUnavailable | None = None
 
-                fc_res = resolve_forecast_for_chat(rows, get_filename=_fn)
+                if use_on_demand:
+                    od_result = await self._try_on_demand_forecast(query, document_ids)
+                    if od_result is not None:
+                        fc_res = od_result
+
+                if fc_res is None and not use_on_demand:
+                    rows = self._analytics_executor.forecast_repo.list_for_documents(  # type: ignore[union-attr]
+                        document_ids
+                    )
+
+                    def _fn(did: str) -> str | None:
+                        info = self._docs.get_document(did)
+                        return info.filename if info else None
+
+                    fc_res = resolve_forecast_for_chat(
+                        rows, get_filename=_fn, user_query=query
+                    )
+
                 if isinstance(fc_res, ForecastChatPayload):
-                    chart_spec = build_forecast_line_chart(fc_res)
-                    payload_json = json.dumps(
-                        dataclasses.asdict(fc_res), indent=2, sort_keys=True
+                    payload_dict, chart_spec, source_payload = (
+                        self._build_forecast_chat_result(fc_res)
                     )
-                    narr = await self._llm.complete(
-                        "You are a helpful analyst. In 2–4 sentences, summarize the baseline "
-                        "linear-trend forecast below for the user. Note that intervals are "
-                        "approximate (residual std × 1.96).",
-                        f"Forecast:\n{payload_json}\n\nUser question: {query}",
-                    )
-                    body = (narr.content or "").strip()
+                    payload_json = json.dumps(payload_dict, indent=2, sort_keys=True)
+                    body = await self._forecast_narration(payload_json, query)
                     answer = (
                         f"{body}\n\n**Forecast (baseline)**\n```json\n{payload_json}\n```\n"
                     )
-                    fd = dataclasses.asdict(fc_res)
                     yield StreamEvent(
                         "meta",
                         {
                             "mode": "OFFLINE_ARCHIVE",
-                            "sources": [self._forecast_source_payload(fc_res)],
+                            "sources": [source_payload],
                             "conversation_id": conversation_id,
-                            "forecast": fd,
+                            "forecast": payload_dict,
                             "chart": chart_spec,
                         },
                     )
@@ -837,7 +1055,7 @@ class ChatService:
                         "done",
                         {
                             "final_text": answer,
-                            "forecast": fd,
+                            "forecast": payload_dict,
                             "chart": chart_spec,
                         },
                     )

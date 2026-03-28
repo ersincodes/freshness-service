@@ -15,37 +15,77 @@ def select_chart_type(user_query: str) -> str:
     return "line_chart"
 
 
+def _freq_label(freq: str) -> str:
+    return {
+        "monthly": "Monthly",
+        "quarterly": "Quarterly",
+        "yearly": "Yearly",
+    }.get(freq, "")
+
+
 def build_forecast_line_chart(payload: ForecastChatPayload) -> dict[str, Any]:
-    """Line chart with forecast horizon (no in-chat historical series yet)."""
-    historical: list[dict[str, str | float]] = []
+    """Line chart with historical data, forecast, and shaded confidence band."""
+    historical_data: list[dict[str, str | float]] = [
+        {"date": h.date, "value": h.value} for h in payload.historical
+    ]
+
+    forecast_dates = payload.forecast_dates
+    if not forecast_dates:
+        forecast_dates = [f"H{i + 1}" for i in range(payload.horizon)]
+
     forecast_data = [
-        {"date": f"H{i + 1}", "value": v} for i, v in enumerate(payload.point)
+        {"date": forecast_dates[i], "value": v}
+        for i, v in enumerate(payload.point)
     ]
     lower_data = [
-        {"date": f"H{i + 1}", "value": v} for i, v in enumerate(payload.lower)
+        {"date": forecast_dates[i], "value": v}
+        for i, v in enumerate(payload.lower)
     ]
     upper_data = [
-        {"date": f"H{i + 1}", "value": v} for i, v in enumerate(payload.upper)
+        {"date": forecast_dates[i], "value": v}
+        for i, v in enumerate(payload.upper)
     ]
-    title = f"{payload.measure} ({payload.sheet})"
+
+    bridge_point: list[dict[str, str | float]] = []
+    if historical_data and forecast_data:
+        last_hist = historical_data[-1]
+        bridge_point = [{"date": str(last_hist["date"]), "value": last_hist["value"]}]
+
+    freq_label = _freq_label(payload.frequency)
+    measure_part = payload.measure
+    if payload.filter_label:
+        measure_part = f"{payload.filter_label} — {measure_part}"
+    title = f"{measure_part} ({payload.sheet})"
     if payload.document:
         title = f"{payload.document} · {title}"
+
+    subtitle = ""
+    if freq_label:
+        subtitle = f"{freq_label} aggregation · Linear trend forecast"
+
+    forecast_start_label = forecast_dates[0] if forecast_dates else "H1"
+
     return {
         "type": "line_chart",
         "title": title,
-        "x_label": "Horizon step",
+        "subtitle": subtitle,
+        "x_label": payload.time_column,
         "y_label": payload.measure,
         "series": [
-            {"name": "Historical", "style": "solid", "data": historical},
+            {
+                "name": "Historical",
+                "style": "solid",
+                "data": historical_data,
+            },
             {
                 "name": "Forecast",
                 "style": "dashed",
-                "data": forecast_data,
-                "confidence_band": {
+                "data": bridge_point + forecast_data,
+                "area_band": {
                     "lower": lower_data,
                     "upper": upper_data,
                 },
             },
         ],
-        "forecast_start": "H1",
+        "forecast_start": forecast_start_label,
     }

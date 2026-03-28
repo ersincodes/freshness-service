@@ -145,13 +145,49 @@ def detect_time_column(
     return None
 
 
+_ID_LIKE_TOKENS = {"id", "index", "code", "key", "number", "num", "no", "hash"}
+_BUSINESS_METRIC_TOKENS = {
+    "revenue", "profit", "sales", "cost", "total", "units",
+    "amount", "price", "quantity", "income", "margin", "earnings",
+}
+
+
+def _measure_sort_key(
+    col_name: str, df: pd.DataFrame, column_types: dict[str, ColumnMetadata]
+) -> tuple[int, int, str]:
+    """Return a sort key that ranks business metrics first, IDs last.
+
+    Tuple: (id_penalty, -business_bonus, col_name)
+    Lower sorts first.
+    """
+    name_lower = col_name.lower()
+    tokens = set(name_lower.replace("_", " ").replace("-", " ").split())
+
+    is_id_like = bool(tokens & _ID_LIKE_TOKENS)
+    is_business = bool(tokens & _BUSINESS_METRIC_TOKENS)
+
+    if not is_business:
+        safe = column_types[col_name].safe_name
+        if safe in df.columns:
+            s = df[safe].dropna()
+            if len(s) > 0 and int(s.nunique()) == len(s):
+                is_id_like = True
+
+    id_penalty = 1 if is_id_like else 0
+    business_bonus = 1 if is_business else 0
+    return (id_penalty, -business_bonus, col_name)
+
+
 def detect_measures(
     df: pd.DataFrame,
     column_types: dict[str, ColumnMetadata],
     time_col_original: str,
 ) -> list[str]:
-    """Numeric measure columns (original names), excluding the time column."""
-    out: list[str] = []
+    """Numeric measure columns (original names), excluding the time column.
+
+    Returned in ranked order: business metrics first, ID-like columns last.
+    """
+    candidates: list[str] = []
     for col_name in sorted(column_types.keys()):
         if col_name.startswith("_") or col_name == time_col_original:
             continue
@@ -164,8 +200,9 @@ def detect_measures(
         s = df[safe]
         if s.notna().mean() <= 0.5:
             continue
-        out.append(col_name)
-    return out
+        candidates.append(col_name)
+    candidates.sort(key=lambda c: _measure_sort_key(c, df, column_types))
+    return candidates
 
 
 def build_timeseries_record(
