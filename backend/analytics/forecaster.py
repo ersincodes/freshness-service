@@ -250,6 +250,9 @@ def compute_filtered_forecast(
     Uses the existing SQL compiler to translate ``plan.filters`` into a WHERE
     clause, fetches the time + measure columns from SQLite, and returns a
     fully-formed ``ForecastChatPayload``.
+
+    Supports ``requested_start`` / ``requested_end`` on the plan to trim
+    forecast output to a specific date window.
     """
     original_to_safe = {
         m.original_name: m.safe_name for m in column_metadata.values()
@@ -295,6 +298,19 @@ def compute_filtered_forecast(
 
     result = forecast_series(agg_series, horizon=plan.horizon, frequency=freq)
 
+    forecast_points = [float(x) for x in result.get("point", [])]
+    forecast_lower = [float(x) for x in result.get("lower", [])]
+    forecast_upper = [float(x) for x in result.get("upper", [])]
+    forecast_dates = [str(d) for d in result.get("forecast_dates", [])]
+
+    if plan.requested_start or plan.requested_end:
+        forecast_points, forecast_lower, forecast_upper, forecast_dates = (
+            _trim_forecast_window(
+                forecast_points, forecast_lower, forecast_upper,
+                forecast_dates, plan.requested_start, plan.requested_end,
+            )
+        )
+
     historical = [
         HistoricalPoint(date=str(h["date"]), value=float(h["value"]))
         for h in result.get("historical", [])
@@ -307,13 +323,117 @@ def compute_filtered_forecast(
         sheet=sheet_name,
         measure=measure_col,
         time_column=time_col,
-        horizon=plan.horizon,
-        point=[float(x) for x in result.get("point", [])],
-        lower=[float(x) for x in result.get("lower", [])],
-        upper=[float(x) for x in result.get("upper", [])],
+        horizon=len(forecast_points),
+        point=forecast_points,
+        lower=forecast_lower,
+        upper=forecast_upper,
         model=str(result.get("model", "linear_trend")),
         frequency=str(result.get("frequency", "unknown")),
         historical=historical,
-        forecast_dates=[str(d) for d in result.get("forecast_dates", [])],
+        forecast_dates=forecast_dates,
         filter_label=plan.filter_label,
     )
+
+
+def _trim_forecast_window(
+    points: list[float],
+    lower: list[float],
+    upper: list[float],
+    dates: list[str],
+    requested_start: str | None,
+    requested_end: str | None,
+) -> tuple[list[float], list[float], list[float], list[str]]:
+    """Trim forecast arrays to only include the requested date window.
+
+    Date labels are strings like 'Jan 2026', 'Feb 2026'. We parse them
+    back to comparable values for filtering.
+    """
+    if not dates or (not requested_start and not requested_end):
+        return points, lower, upper, dates
+
+    from datetime import datetime
+
+    def _parse_label(label: str) -> datetime | None:
+        for fmt in ("%b %Y", "%Y", "Q%q %Y", "%Y-%m"):
+            try:
+                return datetime.strptime(label, fmt)
+            except ValueError:
+                continue
+        try:
+            return pd.to_datetime(label).to_pydatetime()
+        except Exception:
+            return None
+
+    start_dt = None
+    end_dt = None
+    if requested_start:
+        try:
+            start_dt = datetime.strptime(requested_start[:10], "%Y-%m-%d")
+        except ValueError:
+            pass
+    if requested_end:
+        try:
+            end_dt = datetime.strptime(requested_end[:10], "%Y-%m-%d")
+        except ValueError:
+            pass
+
+    if start_dt is None and end_dt is None:
+        return points, lower, upper, dates
+
+    indices: list[int] = []
+    for i, label in enumerate(dates):
+        dt = _parse_label(label)
+        if dt is None:
+            indices.append(i)
+            continue
+        if start_dt and dt < start_dt:
+            continue
+        if end_dt and dt > end_dt:
+            continue
+        indices.append(i)
+
+    if not indices:
+        return points, lower, upper, dates
+
+    return (
+        [points[i] for i in indices if i < len(points)],
+        [lower[i] for i in indices if i < len(lower)],
+        [upper[i] for i in indices if i < len(upper)],
+        [dates[i] for i in indices],
+    )
+
+
+def sanity_check_forecast(
+    historical_values: list[float],
+    forecast_points: list[float],
+) -> list[str]:
+    """Check forecast values against historical data for reasonableness.
+
+    Returns a list of warning strings (empty if all checks pass).
+    """
+    warnings: list[str] = []
+    if not historical_values or not forecast_points:
+        return warnings
+
+    hist_arr = np.array(historical_values)
+    hist_max = float(hist_arr.max())
+    hist_min = float(hist_arr.min())
+    hist_mean = float(hist_arr.mean())
+    all_positive = bool((hist_arr >= 0).all())
+
+    for i, val in enumerate(forecast_points):
+        if all_positive and val < 0:
+            warnings.append(
+                f"Forecast point {i+1} is negative ({val:.2f}) but all "
+                f"historical values are non-negative."
+            )
+        if hist_max > 0 and abs(val) > 3 * hist_max:
+            warnings.append(
+                f"Forecast point {i+1} ({val:.2f}) exceeds 3x the "
+                f"historical maximum ({hist_max:.2f})."
+            )
+
+    if warnings:
+        warnings.insert(0, "Low confidence: forecast values may be unreliable.")
+
+    return warnings
