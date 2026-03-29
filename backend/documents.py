@@ -421,173 +421,6 @@ def process_document(
 # Tabular Analytics Ingestion (SQLite)
 # ============================================================================
 
-_CURRENCY_STRIP_RE = re.compile(r"[\$,€£¥₹\u00a0\u202f]")
-
-
-def _strip_currency_for_numeric_parse(value: Any) -> str | None:
-    """Normalize common spreadsheet currency strings for float/int parsing.
-
-    Handles $, commas, spaces, NBSP, and (1234.56) accounting negatives.
-    Returns a string suitable for float(), or None if empty / not parseable as number.
-    """
-    if value is None:
-        return None
-    if pd is not None and pd.isna(value):
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    neg = False
-    if s.startswith("(") and s.endswith(")"):
-        neg = True
-        s = s[1:-1].strip()
-    s = _CURRENCY_STRIP_RE.sub("", s)
-    s = s.replace(",", "").replace(" ", "")
-    if s.endswith("%"):
-        s = s[:-1].strip()
-    if not s or s in {"-", ".", "-."}:
-        return None
-    if neg:
-        if s.startswith("-"):
-            s = s[1:]
-        s = "-" + s
-    return s
-
-
-def _coerce_loose_numeric_for_inference(value: Any) -> float:
-    """Single-cell numeric coercion for type inference; NaN if not numeric."""
-    t = _strip_currency_for_numeric_parse(value)
-    if t is None:
-        return float("nan")
-    try:
-        return float(t)
-    except ValueError:
-        return float("nan")
-
-
-def _infer_logical_type(series: Any) -> str:
-    """Infer a LogicalType for a pandas Series.
-
-    Priority:
-      1. datetime-like dtype OR high parse success → date
-      2. boolean-like → boolean
-      3. integer-like → integer
-      4. float-like → float
-      5. fallback → string
-    """
-    import datetime as _dt
-
-    non_null = series.dropna()
-    if non_null.empty:
-        return "string"
-
-    # 1. Date detection
-    if pd.api.types.is_datetime64_any_dtype(series):
-        return "date"
-    sample = non_null.iloc[0]
-    if isinstance(sample, (_dt.datetime, _dt.date, pd.Timestamp)):
-        return "date"
-    is_string_dtype = non_null.dtype == object or pd.api.types.is_string_dtype(non_null)
-
-    if is_string_dtype:
-        try:
-            parsed = pd.to_datetime(non_null, errors="coerce")
-            success_ratio = int(parsed.notna().sum()) / len(non_null)
-            if success_ratio >= 0.8:
-                return "date"
-        except Exception:
-            pass
-
-    # 2. Boolean detection
-    _BOOL_VALS = {"true", "false", "yes", "no", "0", "1"}
-    if non_null.dtype == bool or (
-        is_string_dtype
-        and all(str(v).strip().lower() in _BOOL_VALS for v in non_null)
-    ):
-        return "boolean"
-
-    # 3-4. Numeric detection
-    if pd.api.types.is_integer_dtype(series):
-        return "integer"
-    if pd.api.types.is_float_dtype(series):
-        if (non_null == non_null.astype(int)).all():
-            return "integer"
-        return "float"
-    if is_string_dtype:
-        coerced = non_null.map(_coerce_loose_numeric_for_inference)
-        if coerced.notna().sum() / len(non_null) >= 0.9:
-            if (coerced.dropna() == coerced.dropna().astype(int)).all():
-                return "integer"
-            return "float"
-
-    return "string"
-
-
-def _normalize_cell_value(x: Any, logical_type: str) -> Any:
-    """Normalize a cell value according to its logical type.
-
-    - date → epoch seconds (int, UTC)
-    - boolean → 0/1 (int)
-    - integer → int
-    - float → float
-    - string → str (trimmed)
-    """
-    if x is None:
-        return None
-    if pd is not None and pd.isna(x):
-        return None
-
-    import datetime as _dt
-    from datetime import timezone as _tz
-
-    if logical_type == "date":
-        if isinstance(x, pd.Timestamp):
-            if x.tzinfo is None:
-                x = x.tz_localize("UTC")
-            return int(x.timestamp())
-        if isinstance(x, _dt.datetime):
-            if x.tzinfo is None:
-                x = x.replace(tzinfo=_tz.utc)
-            return int(x.timestamp())
-        if isinstance(x, _dt.date):
-            return int(_dt.datetime(x.year, x.month, x.day, tzinfo=_tz.utc).timestamp())
-        try:
-            parsed = pd.to_datetime(x)
-            if parsed.tzinfo is None:
-                parsed = parsed.tz_localize("UTC")
-            return int(parsed.timestamp())
-        except Exception:
-            return None
-
-    if logical_type == "boolean":
-        s = str(x).strip().lower()
-        return 1 if s in {"true", "yes", "1", "1.0"} else 0
-
-    if logical_type == "integer":
-        try:
-            if isinstance(x, str):
-                stripped = _strip_currency_for_numeric_parse(x)
-                if stripped is None:
-                    return None
-                x = stripped
-            return int(float(x))
-        except (ValueError, TypeError):
-            return None
-
-    if logical_type == "float":
-        try:
-            if isinstance(x, str):
-                stripped = _strip_currency_for_numeric_parse(x)
-                if stripped is None:
-                    return None
-                x = stripped
-            return float(x)
-        except (ValueError, TypeError):
-            return None
-
-    # string
-    return str(x).strip()
-
 
 def ingest_excel_to_sqlite(
     *,
@@ -597,20 +430,19 @@ def ingest_excel_to_sqlite(
 ) -> None:
     """Ingest all Excel sheets into typed SQLite tables with profiling.
 
-    Dates are stored as epoch-second INTEGERs.  Booleans as 0/1 INTEGERs.
-    Numeric columns keep their native type.  Strings remain TEXT.
-    Column metadata and dataset profiles are persisted for downstream
-    validation and deterministic query compilation.
+    Delegates data standardization to DataStandardizer, then runs profiling
+    and baseline forecast generation.
     """
     if pd is None:
         logger.warning("pandas is not installed — tabular analytics ingestion skipped")
         return
 
+    from .analytics.ingestion_pipeline import run_profiling_and_forecasts
     from .analytics.metadata_repository import MetadataRepository
-    from .analytics.models import ColumnMetadata, SQLITE_TYPE_MAP
-    from .analytics.profiler import profile_dataframe
+    from .analytics.standardizer import DataStandardizer
 
     meta_repo = MetadataRepository(sqlite_connection)
+    standardizer = DataStandardizer(sqlite_connection)
 
     sheets: dict[str, Any] = pd.read_excel(excel_path, sheet_name=None)
     if not sheets:
@@ -622,183 +454,24 @@ def ingest_excel_to_sqlite(
         if df is None or df.empty:
             continue
 
-        original_headers = [str(c) for c in df.columns]
-        augmented_headers = ["_source_row_number", *original_headers]
+        result = standardizer.standardize_sheet(df, str(sheet_name), document_id)
 
-        # Infer logical types on the raw DataFrame
-        col_logical_types: dict[str, str] = {"_source_row_number": "integer"}
-        for header in original_headers:
-            col_logical_types[header] = _infer_logical_type(df[header])
-
-        logger.info(
-            "Sheet '%s' column types: %s",
-            sheet_name,
-            {h: col_logical_types[h] for h in original_headers},
+        meta_repo.register_table(
+            document_id, result.sheet_name, result.table_name, result.row_count
         )
-
-        df2 = df.copy()
-        df2.insert(0, "_source_row_number", range(1, len(df2) + 1))
-
-        table_name = _build_document_sheet_table_name(
-            document_id=document_id, sheet_name=str(sheet_name)
+        meta_repo.register_columns(
+            document_id, result.sheet_name, list(result.column_metadata.values())
         )
-        original_to_safe = _build_safe_column_mapping(augmented_headers)
-
-        df2.columns = [original_to_safe[h] for h in augmented_headers]
-        df2 = df2.astype(object).where(pd.notnull(df2), None)
-
-        # Typed normalization
-        for header in augmented_headers:
-            safe = original_to_safe[header]
-            ltype = col_logical_types[header]
-            df2[safe] = df2[safe].map(lambda x, lt=ltype: _normalize_cell_value(x, lt))
-
-        # Build column metadata
-        col_meta_list: list[ColumnMetadata] = []
-        for h in augmented_headers:
-            ltype = col_logical_types[h]
-            sqlite_type = SQLITE_TYPE_MAP.get(ltype, "TEXT")
-            nullable = h != "_source_row_number"
-            col_meta_list.append(ColumnMetadata(
-                column_name=h,
-                logical_type=ltype,
-                sqlite_type=sqlite_type,
-                nullable=nullable,
-                original_name=h,
-                safe_name=original_to_safe[h],
-            ))
-
-        col_meta_dict = {m.original_name: m for m in col_meta_list}
-
-        # Create typed table + indices
-        _drop_and_create_typed_table(
-            sqlite_connection=sqlite_connection,
-            table_name=table_name,
-            columns=col_meta_list,
-        )
-
-        safe_cols = [original_to_safe[h] for h in augmented_headers]
-        _bulk_insert(
-            sqlite_connection=sqlite_connection,
-            table_name=table_name,
-            safe_columns=safe_cols,
-            rows=df2.itertuples(index=False, name=None),
-        )
-
-        # Register metadata
-        meta_repo.register_table(document_id, str(sheet_name), table_name, len(df2))
-        meta_repo.register_columns(document_id, str(sheet_name), col_meta_list)
         if str(sheet_name) == str(default_sheet_name):
-            meta_repo.register_default_sheet(document_id, str(sheet_name))
+            meta_repo.register_default_sheet(document_id, result.sheet_name)
 
-        # Compute and persist profile, time-series metadata, and baseline forecasts
-        try:
-            profile = profile_dataframe(df2, col_meta_dict)
-            meta_repo.upsert_profile(document_id, str(sheet_name), profile)
-            from .analytics.forecast_repository import ForecastRepository
-            from .analytics.forecaster import generate_sheet_forecasts
-            from .analytics.profiler import build_timeseries_record, measures_json_dumps
-
-            tcol, mrows, elig, ts_reason = build_timeseries_record(df2, col_meta_dict)
-            meta_repo.upsert_timeseries_meta(
-                document_id,
-                str(sheet_name),
-                tcol,
-                measures_json_dumps(mrows),
-                elig,
-                ts_reason,
-            )
-            if elig and tcol is not None and mrows:
-                fc_repo = ForecastRepository(sqlite_connection)
-                generate_sheet_forecasts(
-                    df2,
-                    col_meta_dict,
-                    document_id,
-                    str(sheet_name),
-                    tcol,
-                    mrows,
-                    fc_repo,
-                )
-        except Exception as exc:
-            logger.warning("Profiling failed for sheet '%s': %s", sheet_name, exc)
+        run_profiling_and_forecasts(
+            sqlite_connection,
+            meta_repo,
+            document_id,
+            result.sheet_name,
+            result.dataframe,
+            result.column_metadata,
+        )
 
     logger.info("Ingested %d sheet(s) for document %s into SQLite", len(sheets), document_id)
-
-
-def _build_document_sheet_table_name(*, document_id: str, sheet_name: str) -> str:
-    doc_part = re.sub(r"[^a-zA-Z0-9_]+", "_", document_id)[:24].strip("_") or "doc"
-    sheet_hash = hashlib.sha1(sheet_name.encode("utf-8")).hexdigest()[:10]
-    return f"doc_{doc_part}__{sheet_hash}"
-
-
-def _build_safe_column_mapping(original_headers: list[str]) -> dict[str, str]:
-    used: set[str] = set()
-    mapping: dict[str, str] = {}
-
-    for raw in original_headers:
-        base = re.sub(r"[^a-zA-Z0-9_]+", "_", str(raw).strip().lower())
-        base = re.sub(r"_+", "_", base).strip("_")
-        base = base or "col"
-
-        candidate = f"col_{base}"
-        if candidate[0].isdigit():
-            candidate = f"col_{candidate}"
-
-        unique = candidate
-        suffix = 2
-        while unique in used:
-            unique = f"{candidate}_{suffix}"
-            suffix += 1
-
-        used.add(unique)
-        mapping[str(raw)] = unique
-
-    return mapping
-
-
-def _drop_and_create_typed_table(
-    *,
-    sqlite_connection: sqlite3.Connection,
-    table_name: str,
-    columns: list,
-) -> None:
-    """Create a table with explicit SQLite types and useful indices."""
-    from .analytics.models import ColumnMetadata  # noqa: used for type hint
-
-    columns_ddl = ", ".join(f"{c.safe_name} {c.sqlite_type}" for c in columns)
-
-    with sqlite_connection:
-        sqlite_connection.execute(f"DROP TABLE IF EXISTS {table_name};")
-        sqlite_connection.execute(f"CREATE TABLE {table_name} ({columns_ddl});")
-
-        for col in columns:
-            if "source_row_number" in col.safe_name:
-                sqlite_connection.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}__rownum "
-                    f"ON {table_name} ({col.safe_name});"
-                )
-            elif col.logical_type == "date":
-                sqlite_connection.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}__{col.safe_name} "
-                    f"ON {table_name} ({col.safe_name});"
-                )
-            elif any(kw in col.original_name.lower() for kw in ("_id", "id", "code", "index")):
-                sqlite_connection.execute(
-                    f"CREATE INDEX IF NOT EXISTS idx_{table_name}__{col.safe_name} "
-                    f"ON {table_name} ({col.safe_name});"
-                )
-
-
-def _bulk_insert(
-    *,
-    sqlite_connection: sqlite3.Connection,
-    table_name: str,
-    safe_columns: list[str],
-    rows: Any,
-) -> None:
-    placeholders = ",".join(["?"] * len(safe_columns))
-    cols_sql = ",".join(safe_columns)
-    sql = f"INSERT INTO {table_name} ({cols_sql}) VALUES ({placeholders});"
-
-    with sqlite_connection:
-        sqlite_connection.executemany(sql, list(rows))

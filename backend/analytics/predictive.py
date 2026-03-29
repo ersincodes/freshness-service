@@ -1,8 +1,9 @@
-"""Keyword-based predictive intent and query-aware forecast resolution."""
+"""Predictive intent detection, forecast resolution, and horizon computation."""
 from __future__ import annotations
 
 import re
 from collections.abc import Callable
+from datetime import datetime
 
 from .forecast_repository import ForecastArtifactRow
 from .models import (
@@ -168,3 +169,72 @@ def query_has_filter_intent(
                     return True
 
     return False
+
+
+# ------------------------------------------------------------------
+# Horizon computation from temporal references
+# ------------------------------------------------------------------
+
+_MAX_HORIZON = {"monthly": 36, "quarterly": 12, "yearly": 5}
+
+
+def compute_horizon(
+    last_data_date: str,
+    requested_end: str | None,
+    frequency: str,
+) -> int | None:
+    """Compute the number of forecast periods needed.
+
+    Args:
+        last_data_date: ISO date string of the last data point (e.g. "2025-12-30").
+        requested_end: ISO date string of the end of the requested window
+                       (e.g. "2026-12-31"). None means use default horizon.
+        frequency: Detected data frequency ("monthly", "quarterly", "yearly").
+
+    Returns:
+        Integer horizon, or None if the request is unreasonable.
+    """
+    if requested_end is None:
+        return 3
+
+    try:
+        last_dt = datetime.strptime(last_data_date[:10], "%Y-%m-%d")
+        end_dt = datetime.strptime(requested_end[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+
+    if end_dt <= last_dt:
+        return None
+
+    delta_days = (end_dt - last_dt).days
+
+    if frequency in ("monthly", "daily", "weekly", "unknown"):
+        horizon = max(1, (delta_days + 15) // 30)
+    elif frequency == "quarterly":
+        horizon = max(1, (delta_days + 45) // 91)
+    elif frequency == "yearly":
+        horizon = max(1, (delta_days + 180) // 365)
+    else:
+        horizon = max(1, (delta_days + 15) // 30)
+
+    max_h = _MAX_HORIZON.get(frequency, 36)
+    if horizon > max_h:
+        return None
+
+    return horizon
+
+
+def validate_horizon(horizon: int, frequency: str) -> tuple[bool, str]:
+    """Check if a horizon is reasonable for the given frequency.
+
+    Returns (is_valid, reason).
+    """
+    max_h = _MAX_HORIZON.get(frequency, 36)
+    if horizon <= 0:
+        return False, "Horizon must be positive"
+    if horizon > max_h:
+        return False, (
+            f"Forecasting {horizon} {frequency} periods ahead is unreliable. "
+            f"Maximum supported: {max_h}."
+        )
+    return True, ""

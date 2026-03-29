@@ -167,6 +167,8 @@ class ForecastPlan(BaseModel):
     filters: list[AnalyticsFilter] = Field(default_factory=list)
     horizon: int = 3
     filter_label: str | None = None
+    requested_start: str | None = None
+    requested_end: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -197,3 +199,40 @@ class ForecastChatPayload:
     historical: list[HistoricalPoint] = field(default_factory=list)
     forecast_dates: list[str] = field(default_factory=list)
     filter_label: str | None = None
+
+
+@dataclass(frozen=True)
+class ForecastValidation:
+    """Result of validating a forecast against historical data."""
+
+    is_valid: bool
+    confidence: Literal["high", "medium", "low"]
+    warnings: list[str] = field(default_factory=list)
+
+
+QueryIntent = Literal["analytics", "forecast", "rag", "cannot_answer"]
+
+
+class QueryPlan(BaseModel):
+    """Unified plan produced by the QueryDecomposer.
+
+    Exactly one of analytics_plan / forecast_plan is populated
+    when intent is 'analytics' or 'forecast'. For 'cannot_answer',
+    cannot_answer_reason explains why.
+    """
+
+    intent: QueryIntent
+    reason: str
+    analytics_plan: AnalyticsPlan | None = None
+    forecast_plan: ForecastPlan | None = None
+    cannot_answer_reason: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_nulls(cls, values: dict) -> dict:
+        if isinstance(values, dict):
+            if values.get("analytics_plan") is None:
+                values["analytics_plan"] = None
+            if values.get("forecast_plan") is None:
+                values["forecast_plan"] = None
+        return values

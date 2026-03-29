@@ -1,4 +1,4 @@
-"""Validate analytics plans and results against metadata and profiles."""
+"""Validate analytics plans, results, and forecasts against metadata and profiles."""
 from __future__ import annotations
 
 import logging
@@ -8,6 +8,8 @@ from .models import (
     AnalyticsPlan,
     ColumnMetadata,
     DatasetProfile,
+    ForecastChatPayload,
+    ForecastValidation,
     DATE_ONLY_OPS,
     NUMERIC_ONLY_OPS,
     STRING_ONLY_OPS,
@@ -185,3 +187,58 @@ def validate_result(
                 "Result count_distinct (%s) exceeds profile row_count (%s)",
                 cd, profile.row_count,
             )
+
+
+# ------------------------------------------------------------------
+# Forecast validation
+# ------------------------------------------------------------------
+
+
+def validate_forecast_result(
+    payload: ForecastChatPayload,
+    expected_periods: int | None = None,
+) -> ForecastValidation:
+    """Validate a forecast payload for reasonableness.
+
+    Checks:
+    - Forecast point count matches expected periods (if provided)
+    - Values are within reasonable bounds of historical data
+    - No negative values when history is all non-negative
+    """
+    warnings: list[str] = []
+
+    if expected_periods is not None and len(payload.point) != expected_periods:
+        warnings.append(
+            f"Expected {expected_periods} forecast points but got {len(payload.point)}."
+        )
+
+    hist_values = [h.value for h in payload.historical]
+    if hist_values and payload.point:
+        hist_max = max(hist_values)
+        hist_min = min(hist_values)
+        all_positive = all(v >= 0 for v in hist_values)
+
+        for i, val in enumerate(payload.point):
+            if all_positive and val < 0:
+                warnings.append(
+                    f"Forecast period {i+1} is negative ({val:.2f}) "
+                    f"but historical values are all non-negative."
+                )
+            if hist_max > 0 and abs(val) > 3 * hist_max:
+                warnings.append(
+                    f"Forecast period {i+1} ({val:.2f}) exceeds 3x "
+                    f"historical maximum ({hist_max:.2f})."
+                )
+
+    if not warnings:
+        confidence = "high"
+    elif len(warnings) <= 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return ForecastValidation(
+        is_valid=len(warnings) == 0,
+        confidence=confidence,
+        warnings=warnings,
+    )
