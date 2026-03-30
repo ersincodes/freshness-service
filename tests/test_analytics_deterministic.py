@@ -35,7 +35,7 @@ from backend.analytics.filter_value_normalizer import normalize_analytics_plan_f
 from backend.analytics.router import AnalyticsRouter
 from backend.analytics.validator import validate_plan, validate_result
 from backend.analytics.errors import AnalyticsPlanValidationError
-from backend.documents import _infer_logical_type, _normalize_cell_value
+from backend.analytics.standardizer import infer_logical_type, normalize_cell
 from backend.services.chat_service import (
     apply_select_rows_limit_from_user_query,
     infer_select_rows_limit_from_query,
@@ -122,39 +122,39 @@ def in_memory_db() -> sqlite3.Connection:
 class TestTypeInference:
     def test_date_column(self):
         s = pd.Series([datetime(2020, 1, 1), datetime(2021, 6, 15), None])
-        assert _infer_logical_type(s) == "date"
+        assert infer_logical_type(s) == "date"
 
     def test_integer_column(self):
         s = pd.Series([1, 2, 3, 4])
-        assert _infer_logical_type(s) == "integer"
+        assert infer_logical_type(s) == "integer"
 
     def test_float_column(self):
         s = pd.Series([1.1, 2.2, 3.3])
-        assert _infer_logical_type(s) == "float"
+        assert infer_logical_type(s) == "float"
 
     def test_boolean_column(self):
         s = pd.Series([True, False, True])
-        assert _infer_logical_type(s) == "boolean"
+        assert infer_logical_type(s) == "boolean"
 
     def test_string_column(self):
         s = pd.Series(["hello", "world", "test"])
-        assert _infer_logical_type(s) == "string"
+        assert infer_logical_type(s) == "string"
 
     def test_string_dates_detected(self):
         s = pd.Series(["2020-01-15", "2021-06-30", "2022-12-01"])
-        assert _infer_logical_type(s) == "date"
+        assert infer_logical_type(s) == "date"
 
     def test_empty_series_defaults_to_string(self):
         s = pd.Series([], dtype=object)
-        assert _infer_logical_type(s) == "string"
+        assert infer_logical_type(s) == "string"
 
     def test_currency_strings_infer_as_float(self):
         s = pd.Series(["$1,234.56", "$2,000.00", "(100.25)", "€500"])
-        assert _infer_logical_type(s) == "float"
+        assert infer_logical_type(s) == "float"
 
     def test_currency_strings_infer_as_integer_when_whole_units(self):
         s = pd.Series([f"${i:,}" for i in range(1, 11)])
-        assert _infer_logical_type(s) == "integer"
+        assert infer_logical_type(s) == "integer"
 
 
 # ============================================================================
@@ -164,38 +164,38 @@ class TestTypeInference:
 class TestCellNormalization:
     def test_date_to_epoch(self):
         d = datetime(2020, 1, 1)
-        epoch = _normalize_cell_value(d, "date")
+        epoch = normalize_cell(d, "date")
         expected = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
         assert epoch == expected
 
     def test_none_returns_none(self):
-        assert _normalize_cell_value(None, "date") is None
+        assert normalize_cell(None, "date") is None
 
     def test_boolean_true(self):
-        assert _normalize_cell_value(True, "boolean") == 1
+        assert normalize_cell(True, "boolean") == 1
 
     def test_boolean_false(self):
-        assert _normalize_cell_value(False, "boolean") == 0
+        assert normalize_cell(False, "boolean") == 0
 
     def test_integer(self):
-        assert _normalize_cell_value("42", "integer") == 42
+        assert normalize_cell("42", "integer") == 42
 
     def test_float(self):
-        assert _normalize_cell_value("3.14", "float") == pytest.approx(3.14)
+        assert normalize_cell("3.14", "float") == pytest.approx(3.14)
 
     def test_string_trim(self):
-        assert _normalize_cell_value("  hello  ", "string") == "hello"
+        assert normalize_cell("  hello  ", "string") == "hello"
 
     def test_date_string_to_epoch(self):
-        epoch = _normalize_cell_value("2020-06-15", "date")
+        epoch = normalize_cell("2020-06-15", "date")
         expected = int(datetime(2020, 6, 15, tzinfo=timezone.utc).timestamp())
         assert epoch == expected
 
     def test_currency_string_normalizes_to_float(self):
-        assert _normalize_cell_value("$1,234.50", "float") == pytest.approx(1234.5)
+        assert normalize_cell("$1,234.50", "float") == pytest.approx(1234.5)
 
     def test_accounting_negative_parentheses_to_float(self):
-        assert _normalize_cell_value("(99.5)", "float") == pytest.approx(-99.5)
+        assert normalize_cell("(99.5)", "float") == pytest.approx(-99.5)
 
 
 # ============================================================================
@@ -488,7 +488,7 @@ class TestEndToEnd:
         headers = list(sample_df.columns)
         col_types = {}
         for h in headers:
-            col_types[h] = _infer_logical_type(sample_df[h])
+            col_types[h] = infer_logical_type(sample_df[h])
 
         safe_names = {h: f"col_{h.lower().replace(' ', '_')}" for h in headers}
 
@@ -511,7 +511,7 @@ class TestEndToEnd:
         for _, row in sample_df.iterrows():
             values = []
             for h in headers:
-                values.append(_normalize_cell_value(row[h], col_types[h]))
+                values.append(normalize_cell(row[h], col_types[h]))
             conn.execute(f"INSERT INTO {table_name} ({safe_cols_sql}) VALUES ({placeholders});", values)
         conn.commit()
 
@@ -855,6 +855,56 @@ def test_normalize_filter_maps_user_phrase_to_profile_value():
     assert keys == {"ES", "US"}
 
 
+def test_normalize_year_equals_on_integer_year_becomes_eq_and_sum_runs():
+    """LLMs often emit year_equals on a spreadsheet Year column; only date columns allow it."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE sales (c_year INTEGER, c_rev REAL)")
+    conn.executemany(
+        "INSERT INTO sales VALUES (?,?)",
+        [(2024, 10.0), (2025, 100.0), (2025, 50.0)],
+    )
+    col_meta = {
+        "Year": ColumnMetadata("Year", "integer", "INTEGER", True, "Year", "c_year"),
+        "Revenue": ColumnMetadata("Revenue", "float", "REAL", True, "Revenue", "c_rev"),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="sum",
+        target_column="Revenue",
+        filters=[AnalyticsFilter(column="Year", operator="year_equals", value=2025)],
+    )
+    with pytest.raises(AnalyticsPlanValidationError):
+        validate_plan(plan, col_meta)
+
+    out = normalize_analytics_plan_filters(plan, col_meta, None, None, None)
+    assert out.filters[0].operator == "eq"
+    assert out.filters[0].value == 2025
+    validate_plan(out, col_meta)
+    compiled = compile_plan(out, table_name="sales", column_metadata=col_meta)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(compiled.sql, tuple(compiled.parameters)).fetchone()
+    assert row["sum_value"] == pytest.approx(150.0)
+
+
+def test_normalize_year_equals_on_date_column_not_rewritten():
+    col_meta = {
+        "OrderDate": ColumnMetadata(
+            "OrderDate", "date", "INTEGER", True, "OrderDate", "c_od"
+        ),
+        "Revenue": ColumnMetadata("Revenue", "float", "REAL", True, "Revenue", "c_rev"),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="sum",
+        target_column="Revenue",
+        filters=[AnalyticsFilter(column="OrderDate", operator="year_equals", value=2025)],
+    )
+    out = normalize_analytics_plan_filters(plan, col_meta, None, None, None)
+    assert out is plan or out.filters[0].operator == "year_equals"
+    assert out.filters[0].operator == "year_equals"
+    validate_plan(out, col_meta)
+
+
 class TestAnalyticsRouterExpanded:
     def test_monthly_sales_trend_routes(self):
         r = AnalyticsRouter()
@@ -1035,3 +1085,64 @@ def test_format_markdown_time_bucket_value_columns():
     md = format_analytics_result_markdown(ar, {})
     assert "| period | value |" in md
     assert "2024-01" in md
+
+
+# ============================================================================
+# strip_filename_from_query (analytics decomposer pre-processing)
+# ============================================================================
+
+
+from backend.services.chat.intents import strip_filename_from_query as _strip_filename
+
+
+class TestStripFilenameFromQuery:
+    def test_removes_in_filename_file(self):
+        q = "What is the total revenue in 2025 in Advanced_Sales_Dataset file ?"
+        out = _strip_filename(q)
+        assert "Advanced_Sales_Dataset" not in out
+        assert "total revenue" in out
+        assert "2025" in out
+        assert out.endswith("?")
+
+    def test_removes_in_filename_spreadsheet(self):
+        q = "What is the total revenue in 2025 in Advanced_Sales_Dataset spreadsheet?"
+        out = _strip_filename(q)
+        assert "Advanced_Sales_Dataset" not in out
+        assert "2025" in out
+
+    def test_removes_from_filename(self):
+        q = "Show revenue from Sales-Data-2025 file"
+        out = _strip_filename(q)
+        assert "Sales-Data-2025" not in out
+        assert "revenue" in out.lower()
+
+    def test_removes_of_filename_dataset(self):
+        q = "Total profit of my_report dataset"
+        out = _strip_filename(q)
+        assert "my_report" not in out
+        assert "profit" in out.lower()
+
+    def test_preserves_query_without_filename(self):
+        q = "What is the total revenue in 2025?"
+        out = _strip_filename(q)
+        assert "total revenue" in out
+        assert "2025" in out
+        assert out.endswith("?")
+
+    def test_preserves_in_keyword_for_year(self):
+        q = "Total sales in 2024?"
+        out = _strip_filename(q)
+        assert "2024" in out
+        assert "sales" in out.lower()
+
+    def test_removes_filename_with_extension(self):
+        q = "What is the average price in Sales_Data.xlsx file?"
+        out = _strip_filename(q)
+        assert "Sales_Data" not in out
+        assert "average price" in out
+
+    def test_removes_quoted_filename(self):
+        q = "Total units in 'Advanced_Sales_Dataset' file?"
+        out = _strip_filename(q)
+        assert "Advanced_Sales_Dataset" not in out
+        assert "units" in out.lower()

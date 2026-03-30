@@ -41,6 +41,7 @@ from .chat.analytics_planning import (
 )
 from .chat.analytics_runner import AnalyticsChatRunner
 from .chat.context import ChatRetrievalDeps, gather_contexts
+from .chat.intents import strip_filename_from_query
 from .chat.prompts import answer_prompt, extraction_prompt, has_usable_context
 from .chat.types import ChatResult, StreamEvent
 
@@ -202,8 +203,10 @@ class ChatService:
         if summary is None:
             return None
 
+        cleaned_query = strip_filename_from_query(query)
+
         try:
-            plan = await self._decomposer.decompose(query, summary)
+            plan = await self._decomposer.decompose(cleaned_query, summary)
         except Exception as exc:
             logger.warning("Query decomposition failed: %s", exc)
             return None
@@ -314,8 +317,10 @@ class ChatService:
         if summary is None:
             return None
 
+        cleaned_query = strip_filename_from_query(query)
+
         try:
-            plan = await self._decomposer.decompose(query, summary)
+            plan = await self._decomposer.decompose(cleaned_query, summary)
         except Exception as exc:
             logger.warning("Stream query decomposition failed: %s", exc)
             return None

@@ -237,7 +237,14 @@ class QueryDecomposer:
             "For 'who buys the most', use groupby_sum on a quantity/revenue column.\n"
             "- For 'which/who + superlative + metric', use groupby_sum with order=value_desc, top_n=1.\n"
             "- Column names must be ORIGINAL header names from the list above.\n"
-            "- Map user phrases to KNOWN CATEGORICAL VALUES (e.g. 'fruits' -> 'Fruits').\n\n"
+            "- Map user phrases to KNOWN CATEGORICAL VALUES (e.g. 'fruits' -> 'Fruits').\n"
+            "- Total or sum for a calendar year: use operation sum on the money column; if there is an "
+            "integer Year column, filter with operator eq and integer value (e.g. 2025). Use year_equals "
+            "only on columns typed as date in AVAILABLE COLUMNS (e.g. OrderDate). Never use year_equals "
+            "on integer or string columns.\n"
+            "- Example (replace names with actual headers): total revenue in 2025 → intent analytics, "
+            "analytics_plan with operation sum, target_column set to the revenue column, "
+            'filters [{"column":"Year","operator":"eq","value":2025}] when Year is integer.\n\n'
         )
 
     def _forecast_plan_schema(self, summary: DatasetSummary) -> str:
