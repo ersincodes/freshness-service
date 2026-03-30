@@ -99,6 +99,23 @@ def _normalize_scalar_value(
     return matched if matched is not None else value
 
 
+def _year_equals_to_eq_on_integer(
+    filt: AnalyticsFilter,
+    column_metadata: dict[str, ColumnMetadata],
+) -> AnalyticsFilter | None:
+    """Map year_equals on an integer column to eq(year): validators only allow year_equals on dates."""
+    if filt.operator != "year_equals" or filt.value is None:
+        return None
+    meta = column_metadata.get(filt.column)
+    if meta is None or meta.logical_type != "integer":
+        return None
+    try:
+        y = int(filt.value)
+    except (TypeError, ValueError):
+        return None
+    return AnalyticsFilter(column=filt.column, operator="eq", value=y)
+
+
 def normalize_analytics_plan_filters(
     plan: AnalyticsPlan,
     column_metadata: dict[str, ColumnMetadata],
@@ -106,11 +123,21 @@ def normalize_analytics_plan_filters(
     conn: sqlite3.Connection | None,
     table_name: str | None,
 ) -> AnalyticsPlan:
-    """Return a copy of plan with string eq/neq filter values aligned to actual cell text."""
+    """Return a copy of plan with repaired filters.
+
+    - year_equals on integer columns (e.g. Year) becomes eq; planners often emit
+      year_equals for calendar-year filters, but validation only allows it on date columns.
+    - String eq/neq values are aligned to actual cell text where possible.
+    """
     original_to_safe = {m.original_name: m.safe_name for m in column_metadata.values()}
     new_filters: list[AnalyticsFilter] = []
     changed = False
     for filt in plan.filters:
+        repaired = _year_equals_to_eq_on_integer(filt, column_metadata)
+        if repaired is not None:
+            changed = True
+            filt = repaired
+
         if filt.operator not in ("eq", "neq"):
             new_filters.append(filt)
             continue

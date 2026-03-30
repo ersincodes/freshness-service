@@ -173,7 +173,7 @@ class AnalyticsChatRunner:
             chart=chart_spec,
         )
 
-    async def execute_analytics_plan(self, plan: AnalyticsPlan) -> ChatResult | None:
+    async def execute_analytics_plan(self, plan: AnalyticsPlan) -> ChatResult:
         try:
             result = await asyncio.to_thread(self._analytics_executor.execute, plan)
             answer = self.format_deterministic_analytics_answer(result)
@@ -185,7 +185,15 @@ class AnalyticsChatRunner:
             )
         except AnalyticsError as exc:
             logger.warning("Analytics execution failed: %s", exc)
-            return None
+            return ChatResult(
+                answer=(
+                    "I could not run that analysis on your spreadsheet. "
+                    "Try rephrasing the question or check that filters match the file columns."
+                ),
+                mode="OFFLINE_ARCHIVE",
+                contexts=[],
+                attached_sources=None,
+            )
 
     async def generate_analytics_plan(
         self, *, user_query: str, document_id: str

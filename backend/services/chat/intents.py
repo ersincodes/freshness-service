@@ -58,6 +58,37 @@ _FILENAME_IN_PATTERN = re.compile(
 
 _LAST_PATTERN = re.compile(r"\b(?:last|final|latest|most recent|bottom)\b", re.IGNORECASE)
 
+_STRIP_FILENAME_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:in|from|of)\s+(?:the\s+)?['\"]?"
+        r"[a-zA-Z0-9_\-]+(?:-\d+)?(?:\.[a-zA-Z0-9]+)?"
+        r"['\"]?\s+(?:file|document|spreadsheet|workbook|sheet|dataset)\s*\??",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bfrom\s+(?:the\s+)?['\"]?"
+        r"[a-zA-Z0-9_\-]+(?:-\d+)?(?:\.[a-zA-Z0-9]+)?"
+        r"['\"]?\s*(?:file|document|spreadsheet|workbook|sheet|dataset)?",
+        re.IGNORECASE,
+    ),
+]
+
+
+def strip_filename_from_query(query: str) -> str:
+    """Remove filename references so the LLM decomposer sees only the analytical question.
+
+    The document is already selected via ``document_ids``; leaving the
+    filename in the prompt causes the LLM to misinterpret it as a filter
+    or column reference.
+    """
+    cleaned = query
+    for pat in _STRIP_FILENAME_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip().rstrip("?").strip()
+    if cleaned:
+        cleaned += "?"
+    return cleaned if cleaned else query
+
 
 def _detect_filename(query: str) -> str | None:
     """Extract filename from query, preferring 'from FILE' over 'in FILE file'."""
