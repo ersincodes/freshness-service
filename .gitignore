@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 knowledge.db
 knowledge.db-*
+*.sql
 chroma_db/
 uploads/
 

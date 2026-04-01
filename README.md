@@ -71,6 +71,13 @@ uvicorn backend.app:app --host 0.0.0.0 --port 8000
 
 4) Start frontend:
 
+Put **Node.js 18+** on your `PATH` once (new terminals pick it up automatically):
+
+- Add your Node install’s `bin` directory to `~/.bashrc` or `~/.zshrc`, **or** use a version manager (nvm, fnm, mise).
+- Example tarball layout under `~/.local` (Linux): prepend `$HOME/.local/node-v22.14.0-linux-x64/bin` to `PATH` in `~/.bashrc`, then run `source ~/.bashrc` or open a new terminal.
+
+If Vite uses a port other than **5173** (because 5173 is busy), set **`CORS_ORIGINS`** to a comma-separated list that includes that origin (see **Environment Variables**).
+
 ```bash
 cd frontend
 npm install
@@ -115,6 +122,7 @@ Core:
 - `LM_STUDIO_BASE_URL` (default: `http://localhost:1111/v1`)
 - `MODEL_NAME` (default: `rnj-1`)
 - `DB_PATH` (default: `knowledge.db`)
+- `CORS_ORIGINS` (comma-separated browser origins; default: `http://localhost:5173`, `http://127.0.0.1:5173` — add e.g. `http://localhost:5174` if Vite picks the next port)
 - `REQUEST_TIMEOUT_S` (default: `10`)
 
 Retrieval:
