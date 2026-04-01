@@ -4,6 +4,18 @@ from dataclasses import dataclass
 from typing import Any
 import os
 
+_DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+
+def _parse_cors_origins(raw: str | None) -> tuple[str, ...]:
+    if raw is None or not raw.strip():
+        return _DEFAULT_CORS_ORIGINS
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return tuple(parts) if parts else _DEFAULT_CORS_ORIGINS
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency
@@ -68,6 +80,8 @@ class Settings:
     # Tabular analytics settings
     enable_tabular_analytics: bool
     analytics_groupby_top_n_default: int
+    # Browser CORS (comma-separated in CORS_ORIGINS env)
+    cors_origins: tuple[str, ...]
 
 
 settings = Settings(
@@ -97,6 +111,7 @@ settings = Settings(
     web_budget_fraction=_getenv_float("WEB_BUDGET_FRACTION", 0.4),
     enable_tabular_analytics=os.getenv("ENABLE_TABULAR_ANALYTICS", "true").strip().lower() in {"true", "1", "yes"},
     analytics_groupby_top_n_default=_getenv_int("ANALYTICS_GROUPBY_TOP_N_DEFAULT", 50),
+    cors_origins=_parse_cors_origins(os.getenv("CORS_ORIGINS")),
 )
 
 _RUNTIME_OVERRIDES: dict[str, Any] = {}
@@ -155,6 +170,11 @@ def get_settings() -> Settings:
         ),
         analytics_groupby_top_n_default=_RUNTIME_OVERRIDES.get(
             "analytics_groupby_top_n_default", base.analytics_groupby_top_n_default
+        ),
+        cors_origins=(
+            tuple(_RUNTIME_OVERRIDES["cors_origins"])
+            if "cors_origins" in _RUNTIME_OVERRIDES
+            else base.cors_origins
         ),
     )
 

@@ -9,12 +9,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .api.routers import archive, chat, documents, freshness, health, legacy, settings as settings_router
+from .config import settings
 from .lifecycle import on_startup
 
 app = FastAPI(title="Freshness Service", version="1.0.0", docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=list(settings.cors_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
