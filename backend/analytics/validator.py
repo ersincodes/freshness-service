@@ -25,9 +25,10 @@ _OPS_REQUIRING_TARGET = {
     "min",
     "max",
     "groupby_sum",
+    "groupby_avg",
     "groupby_ratio",
 }
-_NUMERIC_AGGREGATES = {"sum", "avg", "groupby_sum", "groupby_ratio"}
+_NUMERIC_AGGREGATES = {"sum", "avg", "groupby_sum", "groupby_avg", "groupby_ratio"}
 
 
 def validate_plan(
@@ -70,9 +71,9 @@ def validate_plan(
             )
 
     tg = getattr(plan, "time_grain", "none") or "none"
-    if tg != "none" and plan.operation not in ("groupby_sum", "groupby_count"):
+    if tg != "none" and plan.operation not in ("groupby_sum", "groupby_avg", "groupby_count"):
         raise AnalyticsPlanValidationError(
-            "time_grain is only supported for groupby_sum and groupby_count"
+            "time_grain is only supported for groupby_sum, groupby_avg, and groupby_count"
         )
     if tg != "none" and not plan.time_column:
         raise AnalyticsPlanValidationError("time_grain requires time_column")
@@ -98,9 +99,9 @@ def validate_plan(
                 f"group_by column '{group_col}' not found in columns"
             )
 
-    if plan.operation == "groupby_sum":
+    if plan.operation in ("groupby_sum", "groupby_avg"):
         if tg == "none" and not plan.group_by:
-            raise AnalyticsPlanValidationError("groupby_sum requires group_by")
+            raise AnalyticsPlanValidationError(f"{plan.operation} requires group_by")
         if plan.group_by and plan.group_by not in visible_columns:
             raise AnalyticsPlanValidationError(
                 f"group_by column '{plan.group_by}' not found in columns"

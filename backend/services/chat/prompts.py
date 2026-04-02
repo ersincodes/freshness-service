@@ -59,7 +59,7 @@ def build_analytics_system_prompt(
         "   {\n"
         '     "document_id": "...",\n'
         '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, '
-        'groupby_count, groupby_sum, groupby_ratio, select_rows>",\n'
+        'groupby_count, groupby_sum, groupby_avg, groupby_ratio, select_rows>",\n'
         '     "target_column": "<column name or null>",\n'
         '     "denominator_column": "<for groupby_ratio only; column name or null>",\n'
         '     "group_by": "<column name or null>",\n'
@@ -80,10 +80,10 @@ def build_analytics_system_prompt(
         '              month_equals (value: "YYYY-MM", e.g. "2020-03"),\n'
         '              between_dates (value: ["YYYY-MM-DD", "YYYY-MM-DD"])\n'
         "   - Any:     is_null, is_not_null\n"
-        "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_ratio.\n"
+        "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, groupby_ratio.\n"
         "7. groupby_ratio: target_column = numerator, denominator_column = denominator, "
         "group_by = dimension (e.g. profit margin by category → SUM(profit)/SUM(revenue) per category).\n"
-        "8. group_by is REQUIRED for groupby_sum (unless using time_grain alone), groupby_ratio, "
+        "8. group_by is REQUIRED for groupby_sum, groupby_avg (unless using time_grain alone), groupby_ratio, "
         "and groupby_count (unless using time_grain without a category).\n"
         "9. time_grain: use month/year/week with time_column (a date column) for "
         "monthly sales, seasonality, trends over time. With group_by, you get buckets per period and category.\n"
@@ -91,6 +91,10 @@ def build_analytics_system_prompt(
         "11. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
         "12. For 'highest/lowest sum/total <metric> by <dimension>', use groupby_sum with "
         "target_column=<metric>, group_by=<dimension>, set top_n (e.g. 5 for top 5), order=value_desc or value_asc.\n"
+        "12b. For 'average <metric> by <dimension>', 'mean <metric> per <dimension>', or "
+        "'which <dimension> has the highest/lowest/min/max average <metric>', use **groupby_avg** with "
+        "target_column=<metric>, group_by=<dimension>. Use order=value_asc for lowest/min average, "
+        "order=value_desc for highest/max average.\n"
         "13. Column names must be ORIGINAL Excel header names from the list below.\n"
         "14. document_id must be: " + json.dumps(document_id) + "\n"
         "15. For select_rows, set limit to the exact number of rows the user asked for "

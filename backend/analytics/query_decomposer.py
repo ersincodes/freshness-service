@@ -214,7 +214,7 @@ class QueryDecomposer:
             "{\n"
             f'  "document_id": {json.dumps(summary.document_id)},\n'
             '  "operation": "<count_rows | count_distinct | sum | avg | min | max | '
-            'groupby_count | groupby_sum | groupby_ratio | select_rows>",\n'
+            'groupby_count | groupby_sum | groupby_avg | groupby_ratio | select_rows>",\n'
             '  "target_column": "<column or null>",\n'
             '  "group_by": "<column or null>",\n'
             '  "time_column": "<date column or null>",\n'
@@ -232,10 +232,13 @@ class QueryDecomposer:
             "- Allowed filter operators: eq, neq, gt, gte, lt, lte, contains, startswith, "
             "year_equals (int year), month_equals (YYYY-MM), between_dates ([start, end]), "
             "is_null, is_not_null.\n"
-            "- target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_ratio.\n"
+            "- target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, groupby_ratio.\n"
             "- groupby_count counts ROWS — use it only for 'how many orders/transactions'. "
             "For 'who buys the most', use groupby_sum on a quantity/revenue column.\n"
             "- For 'which/who + superlative + metric', use groupby_sum with order=value_desc, top_n=1.\n"
+            "- For 'average <metric> by <dimension>' or 'which <dimension> has the highest/lowest/min/max "
+            "average <metric>', use groupby_avg with target_column=<metric>, group_by=<dimension>. "
+            "Use order=value_asc for lowest/min average, order=value_desc for highest/max average.\n"
             "- Column names must be ORIGINAL header names from the list above.\n"
             "- Map user phrases to KNOWN CATEGORICAL VALUES (e.g. 'fruits' -> 'Fruits').\n"
             "- Total or sum for a calendar year: use operation sum on the money column; if there is an "

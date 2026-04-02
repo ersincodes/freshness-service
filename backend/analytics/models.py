@@ -19,6 +19,7 @@ AnalyticsOperation = Literal[
     "max",
     "groupby_count",
     "groupby_sum",
+    "groupby_avg",
     "groupby_ratio",
     "select_rows",
 ]
