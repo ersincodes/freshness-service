@@ -1088,6 +1088,191 @@ def test_format_markdown_time_bucket_value_columns():
 
 
 # ============================================================================
+# groupby_avg — compiler, validator, end-to-end
+# ============================================================================
+
+
+class TestGroupbyAvgCompiler:
+    def _col_meta(self) -> dict[str, ColumnMetadata]:
+        return {
+            "Warehouse": ColumnMetadata(
+                column_name="Warehouse",
+                logical_type="string", sqlite_type="TEXT", nullable=True,
+                original_name="Warehouse", safe_name="col_warehouse",
+            ),
+            "LeadTimeDays": ColumnMetadata(
+                column_name="LeadTimeDays",
+                logical_type="integer", sqlite_type="INTEGER", nullable=True,
+                original_name="LeadTimeDays", safe_name="col_lead_time_days",
+            ),
+        }
+
+    def test_groupby_avg_sql(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_avg",
+            target_column="LeadTimeDays",
+            group_by="Warehouse",
+            order="value_asc",
+            top_n=1,
+        )
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "AVG(col_lead_time_days) AS value" in result.sql
+        assert "GROUP BY col_warehouse" in result.sql
+        assert "ORDER BY value ASC" in result.sql
+        assert "LIMIT 1" in result.sql
+
+    def test_groupby_avg_value_desc(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_avg",
+            target_column="LeadTimeDays",
+            group_by="Warehouse",
+            order="value_desc",
+            top_n=5,
+        )
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "AVG(col_lead_time_days) AS value" in result.sql
+        assert "ORDER BY value DESC" in result.sql
+        assert "LIMIT 5" in result.sql
+
+
+def test_groupby_avg_with_time_grain():
+    col_meta = {
+        "OrderDate": ColumnMetadata(
+            "OrderDate", "date", "INTEGER", True, "OrderDate", "c_od"
+        ),
+        "Cat": ColumnMetadata("Cat", "string", "TEXT", True, "Cat", "c_cat"),
+        "Amount": ColumnMetadata("Amount", "float", "REAL", True, "Amount", "c_amt"),
+    }
+    t_jan = int(datetime(2024, 1, 10, tzinfo=timezone.utc).timestamp())
+    t_feb = int(datetime(2024, 2, 5, tzinfo=timezone.utc).timestamp())
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (c_od INTEGER, c_cat TEXT, c_amt REAL)")
+    conn.executemany(
+        "INSERT INTO t VALUES (?,?,?)",
+        [
+            (t_jan, "A", 100.0), (t_jan, "A", 200.0),
+            (t_jan, "B", 50.0),
+            (t_feb, "A", 30.0),
+        ],
+    )
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_avg",
+        target_column="Amount",
+        group_by="Cat",
+        time_column="OrderDate",
+        time_grain="month",
+    )
+    validate_plan(plan, col_meta)
+    compiled = compile_plan(plan, table_name="t", column_metadata=col_meta)
+    assert "AVG(c_amt) AS value" in compiled.sql
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+    by_period = {(r["time_bucket"], r["key"]): r["value"] for r in rows}
+    assert by_period[("2024-01", "A")] == pytest.approx(150.0)
+    assert by_period[("2024-01", "B")] == pytest.approx(50.0)
+    assert by_period[("2024-02", "A")] == pytest.approx(30.0)
+
+
+def test_validator_rejects_groupby_avg_missing_group_by():
+    col_meta = {
+        "Amount": ColumnMetadata(
+            "Amount", "float", "REAL", True, "Amount", "col_amount"
+        ),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_avg",
+        target_column="Amount",
+    )
+    with pytest.raises(AnalyticsPlanValidationError):
+        validate_plan(plan, col_meta)
+
+
+def test_validator_rejects_groupby_avg_non_numeric_target():
+    col_meta = {
+        "Country": ColumnMetadata(
+            "Country", "string", "TEXT", True, "Country", "col_country"
+        ),
+        "Warehouse": ColumnMetadata(
+            "Warehouse", "string", "TEXT", True, "Warehouse", "col_warehouse"
+        ),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_avg",
+        target_column="Country",
+        group_by="Warehouse",
+    )
+    with pytest.raises(AnalyticsPlanValidationError):
+        validate_plan(plan, col_meta)
+
+
+class TestGroupbyAvgEndToEnd(TestEndToEnd):
+    def test_groupby_avg_warehouse_lead_time(self, in_memory_db):
+        """Key scenario: which warehouse has the lowest average lead time."""
+        df = pd.DataFrame([
+            {"Warehouse": "WH-Rome", "LeadTimeDays": 4},
+            {"Warehouse": "WH-Rome", "LeadTimeDays": 6},
+            {"Warehouse": "WH-Rome", "LeadTimeDays": 8},
+            {"Warehouse": "WH-Berlin", "LeadTimeDays": 2},
+            {"Warehouse": "WH-Berlin", "LeadTimeDays": 3},
+            {"Warehouse": "WH-Berlin", "LeadTimeDays": 1},
+            {"Warehouse": "WH-Tokyo", "LeadTimeDays": 5},
+            {"Warehouse": "WH-Tokyo", "LeadTimeDays": 5},
+        ])
+        doc_id, table_name, col_meta = self._ingest_sample(in_memory_db, df)
+        in_memory_db.row_factory = sqlite3.Row
+
+        plan = AnalyticsPlan(
+            document_id=doc_id,
+            operation="groupby_avg",
+            target_column="LeadTimeDays",
+            group_by="Warehouse",
+            order="value_asc",
+            top_n=1,
+        )
+        validate_plan(plan, col_meta)
+        compiled = compile_plan(plan, table_name=table_name, column_metadata=col_meta)
+        rows = in_memory_db.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+
+        assert len(rows) == 1
+        assert rows[0]["key"] == "WH-Berlin"
+        assert rows[0]["value"] == pytest.approx(2.0)
+
+    def test_groupby_avg_all_warehouses(self, in_memory_db):
+        """Verify all per-group averages are correct."""
+        df = pd.DataFrame([
+            {"Warehouse": "WH-Rome", "LeadTimeDays": 4},
+            {"Warehouse": "WH-Rome", "LeadTimeDays": 6},
+            {"Warehouse": "WH-Berlin", "LeadTimeDays": 2},
+            {"Warehouse": "WH-Berlin", "LeadTimeDays": 4},
+            {"Warehouse": "WH-Tokyo", "LeadTimeDays": 10},
+        ])
+        doc_id, table_name, col_meta = self._ingest_sample(in_memory_db, df)
+        in_memory_db.row_factory = sqlite3.Row
+
+        plan = AnalyticsPlan(
+            document_id=doc_id,
+            operation="groupby_avg",
+            target_column="LeadTimeDays",
+            group_by="Warehouse",
+            order="value_asc",
+            top_n=50,
+        )
+        compiled = compile_plan(plan, table_name=table_name, column_metadata=col_meta)
+        rows = in_memory_db.execute(compiled.sql, tuple(compiled.parameters)).fetchall()
+
+        by_key = {r["key"]: r["value"] for r in rows}
+        assert by_key["WH-Berlin"] == pytest.approx(3.0)
+        assert by_key["WH-Rome"] == pytest.approx(5.0)
+        assert by_key["WH-Tokyo"] == pytest.approx(10.0)
+        assert rows[0]["key"] == "WH-Berlin"
+
+
+# ============================================================================
 # strip_filename_from_query (analytics decomposer pre-processing)
 # ============================================================================
 
