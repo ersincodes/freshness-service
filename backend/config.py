@@ -212,3 +212,8 @@ def update_settings(overrides: dict[str, Any]) -> Settings:
             normalized[key] = value
     _RUNTIME_OVERRIDES.update(normalized)
     return get_settings()
+
+
+def reset_runtime_settings() -> None:
+    """Clear all runtime overrides (used by tests to restore process defaults)."""
+    _RUNTIME_OVERRIDES.clear()

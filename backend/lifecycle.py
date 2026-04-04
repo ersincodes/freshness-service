@@ -34,6 +34,11 @@ def _set_process_analytics_connection(conn: sqlite3.Connection | None) -> None:
     _analytics_conn = conn
 
 
+def set_process_metadata_connection(conn: sqlite3.Connection | None) -> None:
+    """Set the process-wide SQLite connection used for tabular metadata (tests, scripts)."""
+    _set_process_analytics_connection(conn)
+
+
 def run_analytics_migrations(db_path: str) -> None:
     """Execute all SQL migration files for tabular analytics schema in order."""
     migrations_dir = Path(__file__).resolve().parent / "migrations"

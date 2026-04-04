@@ -236,17 +236,44 @@ Notes:
 
 ## Testing
 
+Tests need the same Python dependencies as the app (Pydantic, FastAPI, pandas, etc.). **Do not rely on the system-wide `pytest` from apt** unless those packages are installed there; use a project virtualenv:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
 Run all tests:
 
 ```bash
-pytest -q
+.venv/bin/pytest -q
 ```
 
 Deterministic analytics contract tests:
 
 ```bash
-pytest -q tests/test_analytics_deterministic.py
+.venv/bin/pytest -q tests/test_analytics_deterministic.py
 ```
+
+LLM end-to-end chat QA (rubric from `tests/test.md`, cases in `tests/qa_rubric.json`):
+
+- Set `RUN_CHAT_LLM_E2E=1`.
+- Provide a workbook: copy your file to `tests/fixtures/Advanced_Sales_Dataset.xlsx`, or set `FRESHNESS_QA_WORKBOOK` to an absolute path.
+- **LM Studio must accept HTTP from the same machine (or WSL host) that runs pytest.** Before tests, the fixture probes `GET {LM_STUDIO_BASE_URL}/models`.
+- Set `LM_STUDIO_BASE_URL` to the exact base URL from LM Studio’s **Local Server** tab (typically ends with `/v1`). The app default is `http://localhost:1111/v1`; LM Studio often uses **port `1234`**, e.g. `http://127.0.0.1:1234/v1`.
+- Set `MODEL_NAME` to a model id that server exposes (must match what `/v1/models` lists for loaded models).
+- **WSL2:** if LM Studio runs on Windows, `localhost` inside Linux may not reach it. Use the Windows host IP (see `nameserver` in `/etc/resolv.conf`), e.g. `http://172.22.32.1:1234/v1`.
+- Optional: `SKIP_LLM_HEALTHCHECK=1` to skip the probe (not recommended unless you know connectivity is fine).
+
+```bash
+export LM_STUDIO_BASE_URL=http://127.0.0.1:1234/v1
+export MODEL_NAME=your-model-id-from-lm-studio
+RUN_CHAT_LLM_E2E=1 .venv/bin/pytest -q tests/test_chat_rubric_llm_e2e.py
+```
+
+Without `RUN_CHAT_LLM_E2E`, those tests are skipped so default `pytest` runs stay offline-friendly.
+
+If you set `RUN_CHAT_LLM_E2E=1` but all rubric tests **skip**, the workbook is missing: add `tests/fixtures/Advanced_Sales_Dataset.xlsx` or set `FRESHNESS_QA_WORKBOOK`. Run `pytest -rs` to print skip reasons.
 
 ## Security Notes
 
@@ -256,7 +283,8 @@ pytest -q tests/test_analytics_deterministic.py
 
 ## Troubleshooting
 
-- LM Studio unavailable: verify `LM_STUDIO_BASE_URL` and local server status.
+- `ModuleNotFoundError: No module named 'pydantic'` (or similar) when running pytest: you are using a Python that does not have `requirements.txt` installed—typically system `pytest` from apt. Create `.venv`, run `.venv/bin/pip install -r requirements.txt`, and invoke `.venv/bin/pytest`.
+- LM Studio unreachable during **chat rubric** tests: confirm Local Server is **running**; align `LM_STUDIO_BASE_URL` with the shown URL (often `:1234/v1`, not `:1111`). On **WSL2** with LM Studio on Windows, use the Windows host IP, not `localhost`. Quick check: `curl -sS "$LM_STUDIO_BASE_URL/models" | head`. Set `MODEL_NAME` to an id from that response. Use `SKIP_LLM_HEALTHCHECK=1` only to bypass the test probe.
 - Brave search failures: verify `BRAVE_API_KEY`.
 - Empty web extraction: target page may block scraping or require heavy JS.
 - Upload errors: verify file extension and `MAX_UPLOAD_MB`.
