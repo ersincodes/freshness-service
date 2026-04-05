@@ -1137,6 +1137,76 @@ class TestGroupbyAvgCompiler:
         assert "LIMIT 5" in result.sql
 
 
+class TestGroupbyMinCompiler:
+    def _col_meta(self) -> dict[str, ColumnMetadata]:
+        return {
+            "Warehouse": ColumnMetadata(
+                column_name="Warehouse",
+                logical_type="string", sqlite_type="TEXT", nullable=True,
+                original_name="Warehouse", safe_name="col_warehouse",
+            ),
+            "LeadTimeDays": ColumnMetadata(
+                column_name="LeadTimeDays",
+                logical_type="integer", sqlite_type="INTEGER", nullable=True,
+                original_name="LeadTimeDays", safe_name="col_lead_time_days",
+            ),
+        }
+
+    def test_groupby_min_sql(self):
+        plan = AnalyticsPlan(
+            document_id="doc1",
+            operation="groupby_min",
+            target_column="LeadTimeDays",
+            group_by="Warehouse",
+            order="value_asc",
+            top_n=5,
+        )
+        result = compile_plan(plan, table_name="t1", column_metadata=self._col_meta())
+        assert "MIN(col_lead_time_days) AS value" in result.sql
+        assert "GROUP BY col_warehouse" in result.sql
+        assert "ORDER BY value ASC" in result.sql
+        assert "LIMIT 5" in result.sql
+
+
+def test_groupby_ratio_ratio_desc_order():
+    col_meta = {
+        "Region": ColumnMetadata("Region", "string", "TEXT", True, "Region", "c_reg"),
+        "ReturnedQty": ColumnMetadata(
+            "ReturnedQty", "integer", "INTEGER", True, "ReturnedQty", "c_ret"
+        ),
+        "OrderQty": ColumnMetadata(
+            "OrderQty", "integer", "INTEGER", True, "OrderQty", "c_ord"
+        ),
+    }
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="groupby_ratio",
+        target_column="ReturnedQty",
+        denominator_column="OrderQty",
+        group_by="Region",
+        order="ratio_desc",
+        top_n=3,
+    )
+    validate_plan(plan, col_meta)
+    compiled = compile_plan(plan, table_name="t", column_metadata=col_meta)
+    assert "ORDER BY value DESC" in compiled.sql
+
+
+def test_repair_strip_time_grain_on_scalar_sum():
+    from backend.services.chat.analytics_planning import repair_strip_time_grain_for_scalar_ops
+
+    plan = AnalyticsPlan(
+        document_id="d1",
+        operation="sum",
+        target_column="Revenue",
+        time_column="OrderDate",
+        time_grain="year",
+    )
+    out = repair_strip_time_grain_for_scalar_ops(plan)
+    assert out.time_grain == "none"
+    assert out.time_column is None
+
+
 def test_groupby_avg_with_time_grain():
     col_meta = {
         "OrderDate": ColumnMetadata(

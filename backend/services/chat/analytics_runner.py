@@ -30,12 +30,10 @@ from ...analytics.validator import validate_forecast_result
 from ...integrations import LLMClient
 from ...repositories import DocumentRepository
 from .analytics_planning import (
-    apply_select_rows_limit_from_user_query,
+    apply_post_parse_analytics_repairs,
     format_analytics_numeric_hints,
     format_suggested_measure_picks,
     parse_analytics_plan_json,
-    repair_rowcount_plan_to_quantity_sum,
-    repair_select_rows_to_groupby_superlative,
 )
 from .prompts import build_analytics_system_prompt, build_forecast_system_prompt
 from .types import ChatResult
@@ -195,6 +193,22 @@ class AnalyticsChatRunner:
                 attached_sources=None,
             )
 
+    def refine_analytics_plan(
+        self,
+        plan: AnalyticsPlan,
+        user_query: str,
+        summary: DatasetSummary,
+    ) -> AnalyticsPlan:
+        column_names = [c for c in summary.columns if not c.startswith("_")]
+        column_types = {
+            c: m.logical_type
+            for c, m in summary.columns.items()
+            if not c.startswith("_")
+        }
+        return apply_post_parse_analytics_repairs(
+            plan, user_query, column_names, column_types
+        )
+
     async def generate_analytics_plan(
         self, *, user_query: str, document_id: str
     ) -> AnalyticsPlan | None:
@@ -231,11 +245,7 @@ class AnalyticsChatRunner:
         try:
             resp = await self._llm.complete(system_prompt, user_query, temperature=0.0)
             plan = parse_analytics_plan_json(resp.content)
-            plan = apply_select_rows_limit_from_user_query(plan, user_query)
-            plan = repair_rowcount_plan_to_quantity_sum(
-                plan, user_query, column_names, column_types
-            )
-            plan = repair_select_rows_to_groupby_superlative(
+            plan = apply_post_parse_analytics_repairs(
                 plan, user_query, column_names, column_types
             )
             return plan

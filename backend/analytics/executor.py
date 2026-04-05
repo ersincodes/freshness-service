@@ -134,7 +134,13 @@ class AnalyticsExecutor:
                     out_rows.append({"key": d["key"], "count": int(d["cnt"])})
             return {"rows": out_rows}
 
-        if plan.operation in ("groupby_sum", "groupby_avg", "groupby_ratio"):
+        if plan.operation in (
+            "groupby_sum",
+            "groupby_avg",
+            "groupby_min",
+            "groupby_max",
+            "groupby_ratio",
+        ):
             out_rows = []
             for r in rows:
                 d = dict(r)
@@ -200,6 +206,28 @@ class AnalyticsExecutor:
                 )
             return (
                 f"Computed group-by averages of '{plan.target_column}' by "
+                f"'{plan.group_by}' (top {plan.top_n})."
+            )
+        if op == "groupby_min":
+            if plan.time_grain and plan.time_grain != "none":
+                g = plan.group_by or "(time only)"
+                return (
+                    f"Computed minimum of '{plan.target_column}' over {plan.time_grain} "
+                    f"buckets by '{g}' (top {plan.top_n})."
+                )
+            return (
+                f"Computed group-by minimum of '{plan.target_column}' by "
+                f"'{plan.group_by}' (top {plan.top_n})."
+            )
+        if op == "groupby_max":
+            if plan.time_grain and plan.time_grain != "none":
+                g = plan.group_by or "(time only)"
+                return (
+                    f"Computed maximum of '{plan.target_column}' over {plan.time_grain} "
+                    f"buckets by '{g}' (top {plan.top_n})."
+                )
+            return (
+                f"Computed group-by maximum of '{plan.target_column}' by "
                 f"'{plan.group_by}' (top {plan.top_n})."
             )
         if op == "groupby_ratio":

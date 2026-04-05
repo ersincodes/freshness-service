@@ -4,6 +4,7 @@ Chat service for RAG-based question answering with deterministic analytics path.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 from typing import AsyncIterator, Any
@@ -29,13 +30,21 @@ from ..analytics.predictive import (
 from ..analytics.query_decomposer import QueryDecomposer
 from ..analytics.router import AnalyticsRouter
 from ..config import Settings
-from ..domain import SourceContext, determine_retrieval_type, context_to_source_dict, FALLBACK_SOURCE_URL, ErrorCode
+from ..domain import (
+    DOC_URL_PREFIX,
+    SourceContext,
+    determine_retrieval_type,
+    context_to_source_dict,
+    FALLBACK_SOURCE_URL,
+    ErrorCode,
+)
 from ..integrations import LLMClient, BraveClient
 from ..repositories import ArchiveRepository, DocumentRepository
 
 from .chat.analytics_planning import (
     apply_select_rows_limit_from_user_query,
     infer_select_rows_limit_from_query,
+    repair_forecast_plan_horizon,
     repair_rowcount_plan_to_quantity_sum,
     repair_select_rows_to_groupby_superlative,
 )
@@ -109,6 +118,55 @@ class ChatService:
             if summary is not None:
                 return summary
         return None
+
+    def _augment_contexts_with_document_summary(
+        self,
+        contexts: list[SourceContext],
+        include_documents: bool,
+        document_ids: list[str] | None,
+    ) -> list[SourceContext]:
+        """When RAG returns no real sources but a scoped spreadsheet exists, inject metadata outline."""
+        if not include_documents or not document_ids:
+            return contexts
+        if has_usable_context(contexts):
+            return contexts
+        summary = self._get_dataset_summary(document_ids)
+        if summary is None:
+            return contexts
+        info = self._docs.get_document(summary.document_id)
+        filename = info.filename if info else None
+        col_lines = [
+            f"  - {name} ({meta.logical_type})"
+            for name, meta in sorted(summary.columns.items())
+            if not name.startswith("_")
+        ]
+        parts = [
+            "Attached spreadsheet (metadata outline; use for high-level advice, not exact cells):",
+            f"File: {filename or summary.document_id}",
+            f"Sheet: {summary.sheet_name}",
+            f"Row count: {summary.row_count}",
+        ]
+        if summary.date_range:
+            parts.append(f"Date span: {summary.date_range[0]} — {summary.date_range[1]}")
+        if summary.time_column:
+            parts.append(f"Primary date column: {summary.time_column}")
+        if summary.eligible_measures:
+            em = summary.eligible_measures[:20]
+            parts.append(f"Numeric measures: {', '.join(em)}")
+        parts.append("Columns:")
+        parts.extend(col_lines[:80])
+        text = "\n".join(parts)
+        ctx = SourceContext(
+            f"{DOC_URL_PREFIX}{summary.document_id}",
+            text,
+            dt.datetime.now(dt.UTC).isoformat(),
+            False,
+            0.0,
+            filename,
+            None,
+        )
+        rest = [c for c in contexts if c.url != FALLBACK_SOURCE_URL]
+        return [ctx] + rest
 
     async def _execute_forecast_plan(
         self,
@@ -220,12 +278,17 @@ class ChatService:
             )
 
         if plan.intent == "forecast" and plan.forecast_plan:
-            result = await self._execute_forecast_plan(plan.forecast_plan, summary)
+            fc_plan = repair_forecast_plan_horizon(plan.forecast_plan, cleaned_query)
+            result = await self._execute_forecast_plan(fc_plan, summary)
             if result is not None:
                 return result
 
         if plan.intent == "analytics" and plan.analytics_plan:
-            result = await self._execute_analytics_plan(plan.analytics_plan)
+            assert self._runner is not None
+            repaired = self._runner.refine_analytics_plan(
+                plan.analytics_plan, cleaned_query, summary
+            )
+            result = await self._execute_analytics_plan(repaired)
             if result is not None:
                 return result
 
@@ -334,7 +397,8 @@ class ChatService:
             ]
 
         if plan.intent == "forecast" and plan.forecast_plan:
-            result = await self._execute_forecast_plan(plan.forecast_plan, summary)
+            fc_plan = repair_forecast_plan_horizon(plan.forecast_plan, cleaned_query)
+            result = await self._execute_forecast_plan(fc_plan, summary)
             if result is not None:
                 events: list[StreamEvent] = []
                 source_list = result.attached_sources or []
@@ -360,7 +424,11 @@ class ChatService:
                 return events
 
         if plan.intent == "analytics" and plan.analytics_plan:
-            result = await self._execute_analytics_plan(plan.analytics_plan)
+            assert self._runner is not None
+            repaired = self._runner.refine_analytics_plan(
+                plan.analytics_plan, cleaned_query, summary
+            )
+            result = await self._execute_analytics_plan(repaired)
             if result is not None:
                 source_list = result.attached_sources or []
                 return [
@@ -395,7 +463,10 @@ class ChatService:
             include_documents,
             doc_scope,
         )
-        
+        contexts = self._augment_contexts_with_document_summary(
+            contexts, include_documents, doc_scope
+        )
+
         if mode == "OFFLINE_ARCHIVE":
             cached = await self._archive.get_cached_answer_async(query)
             if cached:
@@ -529,6 +600,9 @@ class ChatService:
                 include_web,
                 include_documents,
                 doc_scope,
+            )
+            contexts = self._augment_contexts_with_document_summary(
+                contexts, include_documents, doc_scope
             )
             sources = [context_to_source_dict(c, determine_retrieval_type(mode, self._s.offline_retrieval_mode, c.is_document_source()), self._archive.hash_url) for c in contexts if c.url != FALLBACK_SOURCE_URL]
             meta_payload: dict[str, Any] = {

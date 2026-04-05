@@ -303,6 +303,12 @@ def compute_filtered_forecast(
     forecast_upper = [float(x) for x in result.get("upper", [])]
     forecast_dates = [str(d) for d in result.get("forecast_dates", [])]
 
+    target_h = max(0, plan.horizon)
+    untrimmed_points = list(forecast_points)
+    untrimmed_lower = list(forecast_lower)
+    untrimmed_upper = list(forecast_upper)
+    untrimmed_dates = list(forecast_dates)
+
     if plan.requested_start or plan.requested_end:
         forecast_points, forecast_lower, forecast_upper, forecast_dates = (
             _trim_forecast_window(
@@ -310,6 +316,13 @@ def compute_filtered_forecast(
                 forecast_dates, plan.requested_start, plan.requested_end,
             )
         )
+
+    if target_h > 0 and len(forecast_points) < target_h and untrimmed_points:
+        n = min(target_h, len(untrimmed_points))
+        forecast_points = untrimmed_points[:n]
+        forecast_lower = untrimmed_lower[:n]
+        forecast_upper = untrimmed_upper[:n]
+        forecast_dates = untrimmed_dates[:n]
 
     historical = [
         HistoricalPoint(date=str(h["date"]), value=float(h["value"]))
