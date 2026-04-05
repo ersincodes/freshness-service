@@ -154,6 +154,122 @@ Tabular analytics:
 - `ENABLE_TABULAR_ANALYTICS` (default: `true`)
 - `ANALYTICS_GROUPBY_TOP_N_DEFAULT` (default: `50`)
 
+## Models and chat request flow
+
+### How models are chosen
+
+There is **no ranking, routing, or automatic selection** among multiple candidate models at runtime. Configuration is explicit:
+
+| Role | Mechanism | Default |
+| --- | --- | --- |
+| **Chat / reasoning LLM** | `MODEL_NAME` in [`backend/config.py`](backend/config.py) → `Settings.model_name` → every OpenAI-compatible `/chat/completions` call in [`backend/integrations/llm_client.py`](backend/integrations/llm_client.py) | `rnj-1` |
+| **LM Studio endpoint** | `LM_STUDIO_BASE_URL` in [`backend/config.py`](backend/config.py) | `http://localhost:1111/v1` |
+| **Embedding model (RAG)** | `EMBED_MODEL_NAME` → Chroma [`SentenceTransformerEmbeddingFunction`](backend/vector_store.py) | `sentence-transformers/all-MiniLM-L6-v2` |
+| **Baseline forecasts** | Fixed algorithm: [`sklearn.linear_model.LinearRegression`](backend/analytics/forecaster.py) on prepared time series (not env-selectable) | — |
+
+Details:
+
+- The **chat model id must match** what LM Studio exposes for loaded models. The backend does not pick a model from `/models`; that endpoint is only used for [health checks](backend/integrations/llm_client.py).
+- **`LLMClient` is built per request** in [`chat_service()`](backend/api/deps.py) from `get_settings()`, so `POST /api/config` updates to `model_name` (see [`ConfigUpdate`](backend/api/schemas.py)) apply on the next chat call.
+- **`EMBED_MODEL_NAME`** is used for all Chroma work in [`gather_contexts` / document retrieval](backend/services/chat/context.py) and [document ingestion](backend/api/routers/documents.py). It is **not** in `ConfigUpdate`, so embeddings are effectively **environment-driven** (or test overrides), unlike `model_name` in the settings API.
+- **`OFFLINE_RETRIEVAL_MODE`** (`keyword` vs `semantic`) controls **whether** embedding search runs for web archive and document fallbacks, not **which** embedding model; the model name always comes from `EMBED_MODEL_NAME`.
+
+The same configured LLM is used for JSON-oriented helpers, e.g. [`QueryDecomposer`](backend/analytics/query_decomposer.py) and [`extract_json`](backend/integrations/llm_client.py) inside [`ChatService.get_answer`](backend/services/chat_service.py).
+
+### Request flow (high level)
+
+Non-streaming and streaming share the same branches; streaming emits SSE (`meta`, `token`, `done`, `error`) instead of a single JSON body.
+
+```mermaid
+flowchart TD
+    subgraph client [Client]
+        UI[React UI]
+    end
+
+    subgraph api [FastAPI]
+        ChatPOST["POST /api/chat or /api/chat/stream"]
+        Deps["chat_service: LLMClient plus Brave plus repos from Settings"]
+    end
+
+    subgraph chat [ChatService]
+        DocBranch{"include_documents and document_ids?"}
+        Decomp{"tabular analytics and QueryDecomposer?"}
+        LLMDecompose["LLM: QueryDecomposer.decompose"]
+        Intent{"intent?"}
+        ForecastExec["Execute forecast plan plus optional LLM narration"]
+        AnalyticsExec["Execute analytics plan SQL"]
+        LegacyA["Legacy: keyword predictive plus try_analytics"]
+        Gather["gather_contexts: Brave archive Chroma doc chunks"]
+        Cache{"OFFLINE_ARCHIVE and cached answer?"}
+        Extract["LLM: extract_json structured answer"]
+        UsableCtx{"usable context?"}
+        Complete["LLM: complete or stream"]
+    end
+
+    subgraph retrieval [Retrieval layer]
+        Brave[Brave Search plus scrape]
+        SQLite[SQLite archive]
+        Chroma[Chroma plus SentenceTransformer embeddings]
+        DocRepo[Document chunk search keyword or semantic]
+    end
+
+    UI --> ChatPOST
+    ChatPOST --> Deps
+    Deps --> DocBranch
+
+    DocBranch -->|yes| Decomp
+    Decomp -->|yes| LLMDecompose
+    LLMDecompose --> Intent
+    Intent -->|forecast| ForecastExec
+    Intent -->|analytics| AnalyticsExec
+    Intent -->|cannot_answer| EarlyReturn[Return reason OFFLINE_ARCHIVE]
+    Intent -->|other or failed| Gather
+
+    Decomp -->|no| LegacyA
+    LegacyA -->|ChatResult| Return1[Return]
+    LegacyA -->|prefix or none| Gather
+
+    DocBranch -->|no| Gather
+
+    Gather --> Brave
+    Gather --> SQLite
+    Gather --> Chroma
+    Gather --> DocRepo
+
+    Gather --> Cache
+    Cache -->|hit| ReturnCached[Return cached text]
+    Cache -->|miss| Extract
+    Extract -->|valid JSON answer| ReturnExtract[Return with citation]
+    Extract -->|no| UsableCtx
+    UsableCtx -->|no for offline| ReturnErr[Return guidance message]
+    UsableCtx -->|yes| Complete
+    Complete --> ReturnLLM[Return LLM body]
+
+    ForecastExec --> Return1
+    AnalyticsExec --> Return1
+```
+
+Sequence (matches the diagram):
+
+1. **Request** hits [`backend/api/routers/chat.py`](backend/api/routers/chat.py); [`chat_service()`](backend/api/deps.py) builds `ChatService` with `LLMClient(base_url, model_name, timeout)` from [`get_settings()`](backend/config.py).
+2. **Document-scoped path** (`include_documents` and `document_ids`): when tabular analytics and metadata exist, **QueryDecomposer** calls the LLM for intent (`forecast` / `analytics` / `cannot_answer`). Success yields deterministic analytics or forecast output (forecast may add **LLM narration** via `AnalyticsChatRunner`).
+3. **Legacy analytics** if the decomposer path is unavailable: keyword **predictive** routing and **`try_analytics`** may return before RAG.
+4. **`gather_contexts`** ([`backend/services/chat/context.py`](backend/services/chat/context.py)): **online** (Brave + scrape + optional Chroma upsert when `offline_retrieval_mode == semantic`) and **offline** web (keyword SQLite vs semantic Chroma), plus **document** hybrid retrieval (intent-based exact search, then semantic or keyword chunks). **`prefer_mode`** and **`include_web`** drive ONLINE vs OFFLINE vs LOCAL_WEIGHTS.
+5. **Optional** metadata outline when RAG is empty but a spreadsheet summary exists ([`_augment_contexts_with_document_summary`](backend/services/chat_service.py)).
+6. **OFFLINE_ARCHIVE**: try a **cached answer** from the archive.
+7. **LLM `extract_json`**: structured answer from contexts; on success may **persist** to the archive in ONLINE mode.
+8. If needed, **`complete`** or **`stream`** with the full RAG prompt; ONLINE may **save** the final answer to the archive.
+
+### Key files
+
+- Settings and env: [`backend/config.py`](backend/config.py)
+- LLM calls: [`backend/integrations/llm_client.py`](backend/integrations/llm_client.py)
+- Chat orchestration: [`backend/services/chat_service.py`](backend/services/chat_service.py)
+- Retrieval and modes: [`backend/services/chat/context.py`](backend/services/chat/context.py)
+- Embeddings / Chroma: [`backend/vector_store.py`](backend/vector_store.py)
+- Runtime model URL and name via API: [`backend/api/routers/settings.py`](backend/api/routers/settings.py), [`backend/api/schemas.py`](backend/api/schemas.py) (`ConfigUpdate`)
+- Forecast math: [`backend/analytics/forecaster.py`](backend/analytics/forecaster.py)
+
 ## API Endpoints
 
 Core/chat:
