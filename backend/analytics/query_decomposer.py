@@ -214,7 +214,8 @@ class QueryDecomposer:
             "{\n"
             f'  "document_id": {json.dumps(summary.document_id)},\n'
             '  "operation": "<count_rows | count_distinct | sum | avg | min | max | '
-            'groupby_count | groupby_sum | groupby_avg | groupby_ratio | select_rows>",\n'
+            'groupby_count | groupby_sum | groupby_avg | groupby_min | groupby_max | '
+            'groupby_ratio | select_rows>",\n'
             '  "target_column": "<column or null>",\n'
             '  "group_by": "<column or null>",\n'
             '  "time_column": "<date column or null>",\n'
@@ -232,13 +233,21 @@ class QueryDecomposer:
             "- Allowed filter operators: eq, neq, gt, gte, lt, lte, contains, startswith, "
             "year_equals (int year), month_equals (YYYY-MM), between_dates ([start, end]), "
             "is_null, is_not_null.\n"
-            "- target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, groupby_ratio.\n"
+            "- target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, "
+            "groupby_min, groupby_max, groupby_ratio.\n"
+            "- groupby_ratio always needs target_column (numerator), denominator_column, and group_by; "
+            "return rate by region → SUM(return-like)/SUM(order-or-qty-like) grouped by Region; use order ratio_desc "
+            "to rank highest rate first.\n"
             "- groupby_count counts ROWS — use it only for 'how many orders/transactions'. "
             "For 'who buys the most', use groupby_sum on a quantity/revenue column.\n"
             "- For 'which/who + superlative + metric', use groupby_sum with order=value_desc, top_n=1.\n"
             "- For 'average <metric> by <dimension>' or 'which <dimension> has the highest/lowest/min/max "
             "average <metric>', use groupby_avg with target_column=<metric>, group_by=<dimension>. "
             "Use order=value_asc for lowest/min average, order=value_desc for highest/max average.\n"
+            "- For fastest/shortest/min time per group (e.g. shipping time by warehouse), use groupby_min; "
+            "for slowest/longest use groupby_max.\n"
+            "- time_grain is only valid with groupby_sum, groupby_avg, groupby_min, groupby_max, or groupby_count. "
+            "For scalar totals (e.g. total revenue this year) use sum/avg with filters, time_grain none.\n"
             "- Column names must be ORIGINAL header names from the list above.\n"
             "- Map user phrases to KNOWN CATEGORICAL VALUES (e.g. 'fruits' -> 'Fruits').\n"
             "- Total or sum for a calendar year: use operation sum on the money column; if there is an "
@@ -285,7 +294,11 @@ class QueryDecomposer:
             "- If the user mentions a category/product/region, add a filter.\n"
             "- If no specific measure is mentioned, default to the most relevant "
             "business metric (Revenue > Profit > Quantity).\n"
-            "- Column names must be ORIGINAL header names.\n\n"
+            "- Column names must be ORIGINAL header names.\n"
+            "- If the user asks for the next N months with monthly frequency, set horizon=N and "
+            "either set requested_end to on or after the last day of the N-th future month "
+            "(e.g. data ends Dec 2025, N=3 → end >= 2026-03-31) or set requested_start and "
+            "requested_end to null and rely on horizon alone.\n\n"
         )
 
     def _intent_rules(self) -> str:

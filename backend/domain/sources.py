@@ -26,7 +26,13 @@ class SourceContext:
 
     @classmethod
     def create_fallback(cls) -> "SourceContext":
-        return cls(FALLBACK_SOURCE_URL, FALLBACK_SOURCE_TEXT, dt.datetime.utcnow().isoformat(), False, 0.0)
+        return cls(
+            FALLBACK_SOURCE_URL,
+            FALLBACK_SOURCE_TEXT,
+            dt.datetime.now(dt.UTC).isoformat(),
+            False,
+            0.0,
+        )
 
 
 def determine_retrieval_type(mode: RetrievalMode, offline_mode: str, is_document: bool = False) -> RetrievalType:

@@ -37,7 +37,10 @@ def build_analytics_system_prompt(
         time_block = (
             f"\n\nDETECTED DATE COLUMN (for trends / seasonality): {suggested_time_column!r}\n"
             "Use it as time_column with time_grain month, year, or week when the user asks "
-            "for monthly/yearly/seasonal patterns or trends over time.\n"
+            "for monthly/yearly/seasonal patterns or trends over time. "
+            "Do NOT set time_grain for scalar totals (sum/avg/min/max of the whole sheet or a filtered slice); "
+            "for 'this year' / 'in 2025' use date filters (year_equals on a date column, or eq on an integer Year column) "
+            "with operation sum or avg and time_grain none.\n"
         )
     numeric_block = ""
     if numeric_hints.strip():
@@ -59,7 +62,8 @@ def build_analytics_system_prompt(
         "   {\n"
         '     "document_id": "...",\n'
         '     "operation": "<one of: count_rows, count_distinct, sum, avg, min, max, '
-        'groupby_count, groupby_sum, groupby_avg, groupby_ratio, select_rows>",\n'
+        "groupby_count, groupby_sum, groupby_avg, groupby_min, groupby_max, "
+        'groupby_ratio, select_rows>",\n'
         '     "target_column": "<column name or null>",\n'
         '     "denominator_column": "<for groupby_ratio only; column name or null>",\n'
         '     "group_by": "<column name or null>",\n'
@@ -69,7 +73,7 @@ def build_analytics_system_prompt(
         '     "filters": [\n'
         '       {"column": "...", "operator": "...", "value": ...}\n'
         "     ],\n"
-        '     "order": "count_desc",\n'
+        '     "order": "count_desc | value_desc | ratio_desc | ...",\n'
         '     "top_n": 50,\n'
         '     "limit": 50\n'
         "   }\n"
@@ -80,13 +84,16 @@ def build_analytics_system_prompt(
         '              month_equals (value: "YYYY-MM", e.g. "2020-03"),\n'
         '              between_dates (value: ["YYYY-MM-DD", "YYYY-MM-DD"])\n'
         "   - Any:     is_null, is_not_null\n"
-        "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, groupby_ratio.\n"
-        "7. groupby_ratio: target_column = numerator, denominator_column = denominator, "
-        "group_by = dimension (e.g. profit margin by category → SUM(profit)/SUM(revenue) per category).\n"
-        "8. group_by is REQUIRED for groupby_sum, groupby_avg (unless using time_grain alone), groupby_ratio, "
-        "and groupby_count (unless using time_grain without a category).\n"
-        "9. time_grain: use month/year/week with time_column (a date column) for "
-        "monthly sales, seasonality, trends over time. With group_by, you get buckets per period and category.\n"
+        "6. target_column is REQUIRED for count_distinct, sum, avg, min, max, groupby_sum, groupby_avg, "
+        "groupby_min, groupby_max, groupby_ratio.\n"
+        "7. groupby_ratio: target_column = numerator (e.g. returned quantity), denominator_column = denominator "
+        "(e.g. order quantity), group_by = dimension (return rate by region → ratio per Region). "
+        "For ranking suppliers by return rate use order ratio_desc.\n"
+        "8. group_by is REQUIRED for groupby_sum, groupby_avg, groupby_min, groupby_max (unless using time_grain alone), "
+        "groupby_ratio, and groupby_count (unless using time_grain without a category).\n"
+        "9. time_grain: ONLY with groupby_sum, groupby_avg, groupby_min, groupby_max, or groupby_count — "
+        "use month/year/week with time_column for trends. Never combine time_grain with scalar sum/avg/min/max; "
+        "use filters for calendar periods.\n"
         "10. select_columns specifies which columns to return for select_rows (null = all columns).\n"
         "11. Use select_rows when the user asks to LIST, SHOW, FIND, or GET specific rows or data.\n"
         "12. For 'highest/lowest sum/total <metric> by <dimension>', use groupby_sum with "
@@ -95,6 +102,9 @@ def build_analytics_system_prompt(
         "'which <dimension> has the highest/lowest/min/max average <metric>', use **groupby_avg** with "
         "target_column=<metric>, group_by=<dimension>. Use order=value_asc for lowest/min average, "
         "order=value_desc for highest/max average.\n"
+        "12c. For 'fastest/lowest/minimum <duration or time> by <dimension>' (e.g. shipping time by warehouse), "
+        "use **groupby_min** with target_column=<time column>, group_by=<dimension>, order=value_asc. "
+        "For 'slowest/maximum' use **groupby_max** with order=value_desc.\n"
         "13. Column names must be ORIGINAL Excel header names from the list below.\n"
         "14. document_id must be: " + json.dumps(document_id) + "\n"
         "15. For select_rows, set limit to the exact number of rows the user asked for "

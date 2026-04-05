@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 
-from ...analytics.models import AnalyticsPlan, DatasetProfile
+from ...analytics.models import AnalyticsPlan, DatasetProfile, ForecastPlan
 
 _SELECT_ROWS_FIRST_TOP_RE = re.compile(r"\b(?:first|top)\s+(\d+)\b", re.IGNORECASE)
 _SELECT_ROWS_LIMIT_ONLY_RE = re.compile(r"\b(?:limit|only|just)\s+(\d+)\b", re.IGNORECASE)
@@ -29,6 +29,67 @@ def infer_select_rows_limit_from_query(query: str) -> int | None:
     if m:
         return min(int(m.group(1)), _SELECT_ROWS_LIMIT_CAP)
     return None
+
+
+_FORECAST_HORIZON_CAP = 36
+_FORECAST_NEXT_N_MONTHS_DIGIT_RE = re.compile(
+    r"\b(?:the\s+)?next\s+(\d{1,2})\s+months?\b",
+    re.IGNORECASE,
+)
+_FORECAST_MONTH_WORD_TO_INT: dict[str, int] = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+_FORECAST_NEXT_N_MONTHS_WORD_RE = re.compile(
+    r"\b(?:the\s+)?next\s+("
+    + "|".join(sorted(_FORECAST_MONTH_WORD_TO_INT, key=len, reverse=True))
+    + r")\s+months?\b",
+    re.IGNORECASE,
+)
+
+
+def infer_forecast_horizon_from_query(query: str) -> int | None:
+    """Parse 'next N months' style phrases into a forecast period count (capped)."""
+    if not (query and query.strip()):
+        return None
+    m = _FORECAST_NEXT_N_MONTHS_DIGIT_RE.search(query)
+    if m:
+        n = int(m.group(1))
+        if n < 1:
+            return None
+        return min(n, _FORECAST_HORIZON_CAP)
+    m = _FORECAST_NEXT_N_MONTHS_WORD_RE.search(query)
+    if m:
+        w = m.group(1).lower()
+        n = _FORECAST_MONTH_WORD_TO_INT.get(w)
+        if n is None:
+            return None
+        return min(n, _FORECAST_HORIZON_CAP)
+    return None
+
+
+def repair_forecast_plan_horizon(plan: ForecastPlan, user_query: str) -> ForecastPlan:
+    """Raise horizon from user wording when the model under-shoots; clear narrow date windows."""
+    inferred = infer_forecast_horizon_from_query(user_query)
+    if inferred is None:
+        return plan
+    old_h = plan.horizon
+    new_h = max(plan.horizon, inferred)
+    updates: dict[str, int | None] = {"horizon": new_h}
+    if inferred > old_h:
+        updates["requested_start"] = None
+        updates["requested_end"] = None
+    return plan.model_copy(update=updates)
 
 
 def format_analytics_numeric_hints(profile: DatasetProfile | None) -> str:
@@ -328,6 +389,101 @@ def format_suggested_measure_picks(
     )
 
 
+_SCALAR_OPS_DISALLOWING_TIME_GRAIN = frozenset(
+    {
+        "count_rows",
+        "count_distinct",
+        "sum",
+        "avg",
+        "min",
+        "max",
+    }
+)
+
+
+def repair_strip_time_grain_for_scalar_ops(plan: AnalyticsPlan) -> AnalyticsPlan:
+    """Clear time_grain on scalar aggregates; use date filters for 'this year' style totals."""
+    if plan.operation not in _SCALAR_OPS_DISALLOWING_TIME_GRAIN:
+        return plan
+    tg = getattr(plan, "time_grain", None) or "none"
+    if tg == "none":
+        return plan
+    return plan.model_copy(update={"time_grain": "none", "time_column": None})
+
+
+def repair_groupby_ratio_columns(
+    plan: AnalyticsPlan,
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> AnalyticsPlan:
+    """Fill missing numerator/denominator for return-rate style groupby_ratio when unambiguous."""
+    if plan.operation != "groupby_ratio" or not plan.group_by:
+        return plan
+
+    numer = plan.target_column
+    denom = plan.denominator_column
+
+    return_like = [
+        c
+        for c in column_names
+        if column_types.get(c) in ("integer", "float")
+        and ("return" in _normalize_header_name(c) or "refund" in _normalize_header_name(c))
+    ]
+    denom_candidates = [
+        c
+        for c in column_names
+        if column_types.get(c) in ("integer", "float")
+        and c != numer
+        and any(
+            t in _normalize_header_name(c)
+            for t in ("order", "quantity", "qty", "unit", "transaction")
+        )
+        and "return" not in _normalize_header_name(c)
+    ]
+
+    if not numer and return_like:
+        numer = return_like[0]
+    if not denom and denom_candidates:
+        preferred = [
+            c
+            for c in denom_candidates
+            if "quantity" in _normalize_header_name(c) or "qty" in _normalize_header_name(c)
+        ]
+        pick_from = preferred or denom_candidates
+        for c in pick_from:
+            if c != numer:
+                denom = c
+                break
+
+    updates: dict = {}
+    if numer and not plan.target_column:
+        updates["target_column"] = numer
+    if denom and not plan.denominator_column:
+        updates["denominator_column"] = denom
+    if not updates:
+        return plan
+    return plan.model_copy(update=updates)
+
+
+def apply_post_parse_analytics_repairs(
+    plan: AnalyticsPlan,
+    user_query: str,
+    column_names: list[str],
+    column_types: dict[str, str],
+) -> AnalyticsPlan:
+    """Single entry point for deterministic fixes after LLM JSON is parsed."""
+    plan = repair_strip_time_grain_for_scalar_ops(plan)
+    plan = apply_select_rows_limit_from_user_query(plan, user_query)
+    plan = repair_rowcount_plan_to_quantity_sum(
+        plan, user_query, column_names, column_types
+    )
+    plan = repair_select_rows_to_groupby_superlative(
+        plan, user_query, column_names, column_types
+    )
+    plan = repair_groupby_ratio_columns(plan, column_names, column_types)
+    return plan
+
+
 def apply_select_rows_limit_from_user_query(plan: AnalyticsPlan, user_query: str) -> AnalyticsPlan:
     """When the user explicitly asks for N rows, override planner limit (capped at 500)."""
     if plan.operation != "select_rows":
@@ -353,11 +509,16 @@ def parse_analytics_plan_json(plan_json_text: str) -> AnalyticsPlan:
 
 
 __all__ = [
+    "apply_post_parse_analytics_repairs",
     "apply_select_rows_limit_from_user_query",
     "format_analytics_numeric_hints",
     "format_suggested_measure_picks",
+    "infer_forecast_horizon_from_query",
     "infer_select_rows_limit_from_query",
     "parse_analytics_plan_json",
+    "repair_groupby_ratio_columns",
+    "repair_forecast_plan_horizon",
     "repair_rowcount_plan_to_quantity_sum",
     "repair_select_rows_to_groupby_superlative",
+    "repair_strip_time_grain_for_scalar_ops",
 ]

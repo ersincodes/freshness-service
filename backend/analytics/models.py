@@ -20,6 +20,8 @@ AnalyticsOperation = Literal[
     "groupby_count",
     "groupby_sum",
     "groupby_avg",
+    "groupby_min",
+    "groupby_max",
     "groupby_ratio",
     "select_rows",
 ]
@@ -78,7 +80,16 @@ class AnalyticsPlan(BaseModel):
     target_column: str | None = None
     group_by: str | None = None
     filters: list[AnalyticsFilter] = Field(default_factory=list)
-    order: Literal["count_desc", "count_asc", "value_desc", "value_asc", "key_asc", "key_desc"] = "count_desc"
+    order: Literal[
+        "count_desc",
+        "count_asc",
+        "value_desc",
+        "value_asc",
+        "key_asc",
+        "key_desc",
+        "ratio_desc",
+        "ratio_asc",
+    ] = "count_desc"
     top_n: int = 50
     select_columns: list[str] | None = None
     limit: int = 50

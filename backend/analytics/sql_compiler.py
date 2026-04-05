@@ -174,6 +174,32 @@ def _time_bucket_expr(safe_time_col: str, grain: TimeGrain) -> str:
     raise AnalyticsCompilationError(f"Unsupported time_grain: {grain!r}")
 
 
+def _order_sql_groupby_cnt(plan_order: str, safe_group_col: str) -> str:
+    return {
+        "count_desc": "cnt DESC",
+        "count_asc": "cnt ASC",
+        "value_desc": "cnt DESC",
+        "value_asc": "cnt ASC",
+        "ratio_desc": "cnt DESC",
+        "ratio_asc": "cnt ASC",
+        "key_asc": f"{safe_group_col} ASC",
+        "key_desc": f"{safe_group_col} DESC",
+    }[plan_order]
+
+
+def _order_sql_groupby_value(plan_order: str, safe_group_col: str) -> str:
+    return {
+        "value_desc": "value DESC",
+        "value_asc": "value ASC",
+        "count_desc": "value DESC",
+        "count_asc": "value ASC",
+        "ratio_desc": "value DESC",
+        "ratio_asc": "value ASC",
+        "key_asc": f"{safe_group_col} ASC",
+        "key_desc": f"{safe_group_col} DESC",
+    }[plan_order]
+
+
 # ------------------------------------------------------------------
 # Plan compilation
 # ------------------------------------------------------------------
@@ -241,14 +267,7 @@ def compile_plan(
             tb = _time_bucket_expr(safe_t, plan.time_grain)
             if group_col_name:
                 safe_col = _safe_col(group_col_name, column_metadata, original_to_safe)
-                order_sql = {
-                    "count_desc": "cnt DESC",
-                    "count_asc": "cnt ASC",
-                    "value_desc": "cnt DESC",
-                    "value_asc": "cnt ASC",
-                    "key_asc": f"{safe_col} ASC",
-                    "key_desc": f"{safe_col} DESC",
-                }[plan.order]
+                order_sql = _order_sql_groupby_cnt(plan.order, safe_col)
                 sql = (
                     f"SELECT {tb} AS time_bucket, {safe_col} AS key, COUNT(1) AS cnt "
                     f"FROM {table_name} {where_sql} "
@@ -269,14 +288,7 @@ def compile_plan(
             raise AnalyticsCompilationError("groupby_count requires group_by or target_column")
         safe_col = _safe_col(group_col_name, column_metadata, original_to_safe)
 
-        order_sql = {
-            "count_desc": "cnt DESC",
-            "count_asc": "cnt ASC",
-            "key_asc": f"{safe_col} ASC",
-            "key_desc": f"{safe_col} DESC",
-            "value_desc": "cnt DESC",
-            "value_asc": "cnt ASC",
-        }[plan.order]
+        order_sql = _order_sql_groupby_cnt(plan.order, safe_col)
 
         sql = (
             f"SELECT {safe_col} AS key, COUNT(1) AS cnt "
@@ -307,14 +319,7 @@ def compile_plan(
             safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
             if plan.group_by:
                 safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
-                order_sql = {
-                    "value_desc": "value DESC",
-                    "value_asc": "value ASC",
-                    "count_desc": "value DESC",
-                    "count_asc": "value ASC",
-                    "key_asc": f"{safe_group_col} ASC",
-                    "key_desc": f"{safe_group_col} DESC",
-                }[plan.order]
+                order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
                 sql = (
                     f"SELECT {tb} AS time_bucket, {safe_group_col} AS key, "
                     f"SUM({safe_target_col}) AS value "
@@ -338,15 +343,7 @@ def compile_plan(
         safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
         safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
 
-        order_sql = {
-            "value_desc": "value DESC",
-            "value_asc": "value ASC",
-            # Backward-compatible fallbacks for default/null order values.
-            "count_desc": "value DESC",
-            "count_asc": "value ASC",
-            "key_asc": f"{safe_group_col} ASC",
-            "key_desc": f"{safe_group_col} DESC",
-        }[plan.order]
+        order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
 
         sql = (
             f"SELECT {safe_group_col} AS key, SUM({safe_target_col}) AS value "
@@ -377,14 +374,7 @@ def compile_plan(
             safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
             if plan.group_by:
                 safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
-                order_sql = {
-                    "value_desc": "value DESC",
-                    "value_asc": "value ASC",
-                    "count_desc": "value DESC",
-                    "count_asc": "value ASC",
-                    "key_asc": f"{safe_group_col} ASC",
-                    "key_desc": f"{safe_group_col} DESC",
-                }[plan.order]
+                order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
                 sql = (
                     f"SELECT {tb} AS time_bucket, {safe_group_col} AS key, "
                     f"AVG({safe_target_col}) AS value "
@@ -408,17 +398,120 @@ def compile_plan(
         safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
         safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
 
-        order_sql = {
-            "value_desc": "value DESC",
-            "value_asc": "value ASC",
-            "count_desc": "value DESC",
-            "count_asc": "value ASC",
-            "key_asc": f"{safe_group_col} ASC",
-            "key_desc": f"{safe_group_col} DESC",
-        }[plan.order]
+        order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
 
         sql = (
             f"SELECT {safe_group_col} AS key, AVG({safe_target_col}) AS value "
+            f"FROM {table_name} "
+            f"{where_sql} "
+            f"GROUP BY {safe_group_col} "
+            f"ORDER BY {order_sql} "
+            f"LIMIT {top_n};"
+        )
+        return CompiledSql(sql=sql, parameters=params)
+
+    if plan.operation == "groupby_min":
+        _require_target(plan)
+        top_n = max(1, min(plan.top_n, 1000))
+        use_time = plan.time_grain and plan.time_grain != "none"
+        if use_time:
+            if not plan.time_column:
+                raise AnalyticsCompilationError(
+                    "time_column is required when time_grain is set"
+                )
+            tmeta = column_metadata.get(plan.time_column)
+            if not tmeta or tmeta.logical_type != "date":
+                raise AnalyticsCompilationError(
+                    f"time_column '{plan.time_column}' must be a date column"
+                )
+            safe_t = _safe_col(plan.time_column, column_metadata, original_to_safe)
+            tb = _time_bucket_expr(safe_t, plan.time_grain)
+            safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+            if plan.group_by:
+                safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+                order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
+                sql = (
+                    f"SELECT {tb} AS time_bucket, {safe_group_col} AS key, "
+                    f"MIN({safe_target_col}) AS value "
+                    f"FROM {table_name} {where_sql} "
+                    f"GROUP BY 1, 2 "
+                    f"ORDER BY time_bucket ASC, {order_sql} "
+                    f"LIMIT {top_n};"
+                )
+                return CompiledSql(sql=sql, parameters=params)
+            sql = (
+                f"SELECT {tb} AS time_bucket, MIN({safe_target_col}) AS value "
+                f"FROM {table_name} {where_sql} "
+                f"GROUP BY 1 "
+                f"ORDER BY time_bucket ASC "
+                f"LIMIT {top_n};"
+            )
+            return CompiledSql(sql=sql, parameters=params)
+        if not plan.group_by:
+            raise AnalyticsCompilationError("groupby_min requires group_by")
+
+        safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+        safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+
+        order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
+
+        sql = (
+            f"SELECT {safe_group_col} AS key, MIN({safe_target_col}) AS value "
+            f"FROM {table_name} "
+            f"{where_sql} "
+            f"GROUP BY {safe_group_col} "
+            f"ORDER BY {order_sql} "
+            f"LIMIT {top_n};"
+        )
+        return CompiledSql(sql=sql, parameters=params)
+
+    if plan.operation == "groupby_max":
+        _require_target(plan)
+        top_n = max(1, min(plan.top_n, 1000))
+        use_time = plan.time_grain and plan.time_grain != "none"
+        if use_time:
+            if not plan.time_column:
+                raise AnalyticsCompilationError(
+                    "time_column is required when time_grain is set"
+                )
+            tmeta = column_metadata.get(plan.time_column)
+            if not tmeta or tmeta.logical_type != "date":
+                raise AnalyticsCompilationError(
+                    f"time_column '{plan.time_column}' must be a date column"
+                )
+            safe_t = _safe_col(plan.time_column, column_metadata, original_to_safe)
+            tb = _time_bucket_expr(safe_t, plan.time_grain)
+            safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+            if plan.group_by:
+                safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+                order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
+                sql = (
+                    f"SELECT {tb} AS time_bucket, {safe_group_col} AS key, "
+                    f"MAX({safe_target_col}) AS value "
+                    f"FROM {table_name} {where_sql} "
+                    f"GROUP BY 1, 2 "
+                    f"ORDER BY time_bucket ASC, {order_sql} "
+                    f"LIMIT {top_n};"
+                )
+                return CompiledSql(sql=sql, parameters=params)
+            sql = (
+                f"SELECT {tb} AS time_bucket, MAX({safe_target_col}) AS value "
+                f"FROM {table_name} {where_sql} "
+                f"GROUP BY 1 "
+                f"ORDER BY time_bucket ASC "
+                f"LIMIT {top_n};"
+            )
+            return CompiledSql(sql=sql, parameters=params)
+        if not plan.group_by:
+            raise AnalyticsCompilationError("groupby_max requires group_by")
+
+        safe_group_col = _safe_col(plan.group_by, column_metadata, original_to_safe)
+        safe_target_col = _safe_col(plan.target_column, column_metadata, original_to_safe)
+
+        order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
+
+        sql = (
+            f"SELECT {safe_group_col} AS key, MAX({safe_target_col}) AS value "
             f"FROM {table_name} "
             f"{where_sql} "
             f"GROUP BY {safe_group_col} "
@@ -437,14 +530,7 @@ def compile_plan(
         safe_num = _safe_col(plan.target_column, column_metadata, original_to_safe)
         safe_den = _safe_col(plan.denominator_column, column_metadata, original_to_safe)
 
-        order_sql = {
-            "value_desc": "value DESC",
-            "value_asc": "value ASC",
-            "count_desc": "value DESC",
-            "count_asc": "value ASC",
-            "key_asc": f"{safe_group_col} ASC",
-            "key_desc": f"{safe_group_col} DESC",
-        }[plan.order]
+        order_sql = _order_sql_groupby_value(plan.order, safe_group_col)
 
         top_n = max(1, min(plan.top_n, 1000))
         sql = (
